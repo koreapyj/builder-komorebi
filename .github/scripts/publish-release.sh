@@ -16,7 +16,11 @@ esac
 [[ $UPSTREAM_SHA =~ ^[0-9a-f]{40}$ ]] || fail "UPSTREAM_SHA '$UPSTREAM_SHA' is not a commit SHA"
 [[ $BUILDER_SHA =~ ^[0-9a-f]{40}$ ]] || fail "BUILDER_SHA '$BUILDER_SHA' is not a commit SHA"
 apks=("$dist"/*.apk)
-[ "${#apks[@]}" -gt 0 ] || fail "no APKs in $dist"
+if [ "${#apks[@]}" -eq 0 ]; then
+  echo "Contents of $dist:" >&2
+  find "$dist" -maxdepth 3 >&2 || true
+  fail "no APKs directly in $dist. APKs in subdirectories mean download-artifact got an empty artifact name and downloaded every artifact (e.g. a job output dropped because it contained a secret's value)."
+fi
 
 body=$(cat <<EOF
 Upstream [\`$UPSTREAM_TAG\`](https://github.com/$UPSTREAM_REPO/releases/tag/$UPSTREAM_TAG) (\`${UPSTREAM_SHA:0:7}\`) with this repository's patches at \`${BUILDER_SHA:0:7}\`.

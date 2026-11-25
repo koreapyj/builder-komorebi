@@ -11,14 +11,10 @@ on:
     - cron: '17 3 * * *'
   workflow_dispatch:
     inputs:
-      publish:
-        description: Publish a release of this channel (main is published automatically)
-        type: choice
-        options:
-          - none
-          - stable
-          - beta
-        default: none
+      force:
+        description: Build every existing channel even if nothing changed
+        type: boolean
+        default: false
 
 concurrency:
   group: >-
@@ -30,32 +26,37 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  UPSTREAM_REPO: BeerEgg2001/Komorebi
-
 jobs:
   resolve:
     name: Resolve upstream refs
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
     outputs:
-      upstream_repo: ${{ env.UPSTREAM_REPO }}
+      on_default_branch: ${{ steps.branch.outputs.on_default_branch }}
+      variant: ${{ steps.resolve.outputs.variant }}
+      stable_build: ${{ steps.resolve.outputs.stable_build }}
       stable_ref: ${{ steps.resolve.outputs.stable_ref }}
       stable_sha: ${{ steps.resolve.outputs.stable_sha }}
       stable_release_tag: ${{ steps.resolve.outputs.stable_release_tag }}
       stable_label: ${{ steps.resolve.outputs.stable_label }}
       stable_version_name: ${{ steps.resolve.outputs.stable_version_name }}
+      stable_marker: ${{ steps.resolve.outputs.stable_marker }}
+      beta_build: ${{ steps.resolve.outputs.beta_build }}
       beta_ref: ${{ steps.resolve.outputs.beta_ref }}
       beta_sha: ${{ steps.resolve.outputs.beta_sha }}
       beta_release_tag: ${{ steps.resolve.outputs.beta_release_tag }}
       beta_label: ${{ steps.resolve.outputs.beta_label }}
       beta_version_name: ${{ steps.resolve.outputs.beta_version_name }}
+      beta_marker: ${{ steps.resolve.outputs.beta_marker }}
+      main_build: ${{ steps.resolve.outputs.main_build }}
       main_ref: ${{ steps.resolve.outputs.main_ref }}
       main_sha: ${{ steps.resolve.outputs.main_sha }}
       main_label: ${{ steps.resolve.outputs.main_label }}
       main_version_name: ${{ steps.resolve.outputs.main_version_name }}
-      upstream_stable: ${{ steps.resolve.outputs.upstream_stable }}
-      upstream_newest_beta: ${{ steps.resolve.outputs.upstream_newest_beta }}
+      main_marker: ${{ steps.resolve.outputs.main_marker }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -63,76 +64,92 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github
 
-      - name: Resolve stable, beta and main
+      # The schedule event payload has no repository object; scheduled runs are always on the default branch.
+      - name: Check branch
+        id: branch
+        env:
+          ON_DEFAULT: ${{ github.event_name == 'schedule' || github.ref_name == github.event.repository.default_branch }}
+        run: echo "on_default_branch=$ON_DEFAULT" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve channels
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM_REPO: BeerEgg2001/Komorebi
           RUN_NUMBER: ${{ github.run_number }}
-        run: python3 -I .github/scripts/resolve_upstream.py
+          RUN_ID: ${{ github.run_id }}
+          BUILDER_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+          HAS_SIGNING_KEY: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        run: python3 -I .github/scripts/ci.py resolve
 
   build-stable:
     name: stable
     needs: resolve
-    if: needs.resolve.outputs.stable_ref != ''
+    if: needs.resolve.outputs.stable_build == 'true'
     uses: ./.github/workflows/build-channel.yaml
     secrets: inherit
     with:
       channel: stable
-      upstream_repo: ${{ needs.resolve.outputs.upstream_repo }}
+      upstream_repo: BeerEgg2001/Komorebi
       upstream_ref: ${{ needs.resolve.outputs.stable_ref }}
       upstream_sha: ${{ needs.resolve.outputs.stable_sha }}
       release_tag: ${{ needs.resolve.outputs.stable_release_tag }}
       label: ${{ needs.resolve.outputs.stable_label }}
       version_name: ${{ needs.resolve.outputs.stable_version_name }}
-      publishing: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == 'stable' }}
+      variant: ${{ needs.resolve.outputs.variant }}
+      marker: ${{ needs.resolve.outputs.stable_marker }}
 
   build-beta:
     name: beta
     needs: resolve
-    if: needs.resolve.outputs.beta_ref != ''
+    if: needs.resolve.outputs.beta_build == 'true'
     uses: ./.github/workflows/build-channel.yaml
     secrets: inherit
     with:
       channel: beta
-      upstream_repo: ${{ needs.resolve.outputs.upstream_repo }}
+      upstream_repo: BeerEgg2001/Komorebi
       upstream_ref: ${{ needs.resolve.outputs.beta_ref }}
       upstream_sha: ${{ needs.resolve.outputs.beta_sha }}
       release_tag: ${{ needs.resolve.outputs.beta_release_tag }}
       label: ${{ needs.resolve.outputs.beta_label }}
       version_name: ${{ needs.resolve.outputs.beta_version_name }}
-      publishing: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == 'beta' }}
+      variant: ${{ needs.resolve.outputs.variant }}
+      marker: ${{ needs.resolve.outputs.beta_marker }}
 
   build-main:
     name: main
     needs: resolve
+    if: needs.resolve.outputs.main_build == 'true'
     uses: ./.github/workflows/build-channel.yaml
     secrets: inherit
     with:
       channel: main
-      upstream_repo: ${{ needs.resolve.outputs.upstream_repo }}
+      upstream_repo: BeerEgg2001/Komorebi
       upstream_ref: ${{ needs.resolve.outputs.main_ref }}
       upstream_sha: ${{ needs.resolve.outputs.main_sha }}
       release_tag: ''
       label: ${{ needs.resolve.outputs.main_label }}
       version_name: ${{ needs.resolve.outputs.main_version_name }}
+      variant: ${{ needs.resolve.outputs.variant }}
+      marker: ${{ needs.resolve.outputs.main_marker }}
 
   publish-main:
-    name: Publish main
+    name: Publish nightly
     needs: [resolve, build-main]
-    if: >-
-      github.event_name == 'schedule'
-      || (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch)
+    if: needs.resolve.outputs.on_default_branch == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: write
-    # a running publish is never cancelled
     concurrency:
       group: ${{ github.workflow }}-publish-main
       cancel-in-progress: false
     steps:
       - name: Require release-signed APKs
-        if: needs.build-main.outputs.signed != 'true'
+        if: needs.resolve.outputs.variant != 'release'
         run: |
           echo "::error::The main build is not signed with the release key (KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS secrets missing); refusing to publish it."
           exit 1
@@ -146,86 +163,50 @@ jobs:
       - name: Download APKs
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.build-main.outputs.artifact }}
+          name: apks-main
           path: dist
 
-      - name: Update the main release
+      - name: Update the nightly release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           BUILDER_SHA: ${{ github.sha }}
-          UPSTREAM_SHA: ${{ needs.build-main.outputs.upstream_sha }}
-          UPSTREAM_REPO: ${{ needs.resolve.outputs.upstream_repo }}
+          UPSTREAM_SHA: ${{ needs.resolve.outputs.main_sha }}
+          UPSTREAM_REPO: BeerEgg2001/Komorebi
           LABEL: ${{ needs.resolve.outputs.main_label }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: bash .github/scripts/publish-main.sh dist
 
-  # !cancelled() so a clear error is reported even if the requested channel failed to build or does not exist.
-  publish-release:
-    name: Publish ${{ inputs.publish }}
-    needs: [resolve, build-stable, build-beta]
-    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.publish != 'none' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  release-stable:
+    name: Release stable
+    needs: [resolve, build-stable]
+    if: needs.resolve.outputs.on_default_branch == 'true'
+    uses: ./.github/workflows/release.yaml
     permissions:
+      actions: read
       contents: write
-    concurrency:
-      group: ${{ github.workflow }}-publish-${{ inputs.publish }}
-      cancel-in-progress: false
-    env:
-      CHANNEL: ${{ inputs.publish }}
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-      RESOLVE_RESULT: ${{ needs.resolve.result }}
-      UPSTREAM_STABLE: ${{ needs.resolve.outputs.upstream_stable }}
-      UPSTREAM_NEWEST_BETA: ${{ needs.resolve.outputs.upstream_newest_beta }}
-      REF: ${{ needs.resolve.outputs[format('{0}_ref', inputs.publish)] }}
-      RELEASE_TAG: ${{ needs.resolve.outputs[format('{0}_release_tag', inputs.publish)] }}
-      BUILD_RESULT: ${{ needs[format('build-{0}', inputs.publish)].result }}
-      SIGNED: ${{ needs[format('build-{0}', inputs.publish)].outputs.signed }}
-      VERSION_CHECK: ${{ needs[format('build-{0}', inputs.publish)].outputs.version_check }}
-      ARTIFACT: ${{ needs[format('build-{0}', inputs.publish)].outputs.artifact }}
-      UPSTREAM_SHA: ${{ needs[format('build-{0}', inputs.publish)].outputs.upstream_sha }}
-    steps:
-      - name: Check that ${{ inputs.publish }} can be published
-        run: |
-          set -eu
-          err() { echo "::error::$*"; exit 1; }
-          [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ] \
-            || err "Releases are published only from the default branch ($DEFAULT_BRANCH), not $GITHUB_REF_NAME."
-          [ "$RESOLVE_RESULT" = success ] || err "Resolving the upstream refs failed."
-          if [ -z "$RELEASE_TAG" ]; then
-            if [ "$CHANNEL" = beta ]; then
-              err "There is no beta channel: upstream's newest beta (${UPSTREAM_NEWEST_BETA:-none}) is not newer than its latest stable release (${UPSTREAM_STABLE:-none})."
-            fi
-            err "Upstream has no stable release to build."
-          fi
-          [ "$BUILD_RESULT" = success ] \
-            || err "The $CHANNEL build ($REF) did not succeed (result: $BUILD_RESULT); nothing is published."
-          [ "$SIGNED" = true ] \
-            || err "The $CHANNEL build is not signed with the release key (KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS secrets missing); refusing to publish it."
-          [ "$VERSION_CHECK" = ok ] \
-            || err "Version check for $REF is '$VERSION_CHECK' (see the build job's summary)."
-          echo "Publishing $RELEASE_TAG from upstream $REF ($UPSTREAM_SHA)"
+    with:
+      channel: stable
+      upstream_repo: BeerEgg2001/Komorebi
+      upstream_ref: ${{ needs.resolve.outputs.stable_ref }}
+      upstream_sha: ${{ needs.resolve.outputs.stable_sha }}
+      release_tag: ${{ needs.resolve.outputs.stable_release_tag }}
+      variant: ${{ needs.resolve.outputs.variant }}
+      marker: ${{ needs.resolve.outputs.stable_marker }}
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          sparse-checkout: .github
-
-      - name: Download APKs
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.ARTIFACT }}
-          path: dist
-
-      - name: Create the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          BUILDER_SHA: ${{ github.sha }}
-          UPSTREAM_REPO: ${{ needs.resolve.outputs.upstream_repo }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          export UPSTREAM_TAG=${REF#refs/tags/}
-          bash .github/scripts/publish-release.sh dist
+  release-beta:
+    name: Release beta
+    needs: [resolve, build-beta]
+    if: needs.resolve.outputs.on_default_branch == 'true'
+    uses: ./.github/workflows/release.yaml
+    permissions:
+      actions: read
+      contents: write
+    with:
+      channel: beta
+      upstream_repo: BeerEgg2001/Komorebi
+      upstream_ref: ${{ needs.resolve.outputs.beta_ref }}
+      upstream_sha: ${{ needs.resolve.outputs.beta_sha }}
+      release_tag: ${{ needs.resolve.outputs.beta_release_tag }}
+      variant: ${{ needs.resolve.outputs.variant }}
+      marker: ${{ needs.resolve.outputs.beta_marker }}

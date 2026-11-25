@@ -11,8 +11,13 @@ fail() { echo "::error::$*" >&2; exit 1; }
 
 [[ $UPSTREAM_SHA =~ ^[0-9a-f]{40}$ ]] || fail "UPSTREAM_SHA '$UPSTREAM_SHA' is not a commit SHA"
 [[ $BUILDER_SHA =~ ^[0-9a-f]{40}$ ]] || fail "BUILDER_SHA '$BUILDER_SHA' is not a commit SHA"
+[[ $LABEL =~ ^main-[0-9]+$ ]] || fail "unexpected label '$LABEL'"
 apks=("$dist"/*.apk)
-[ "${#apks[@]}" -gt 0 ] || fail "no APKs in $dist"
+if [ "${#apks[@]}" -eq 0 ]; then
+  echo "Contents of $dist:" >&2
+  find "$dist" -maxdepth 3 >&2 || true
+  fail "no APKs directly in $dist. APKs in subdirectories mean download-artifact got an empty artifact name and downloaded every artifact (e.g. a job output dropped because it contained a secret's value)."
+fi
 
 get_or_404() {
   local out err
@@ -41,6 +46,11 @@ if [ "${#ids[@]}" -gt 0 ]; then
   echo "Current '$tag' release: id $id, draft=$draft, ${current:-no build-info line}, $napk APK(s)"
   if [ "$current" = "$marker" ] && [ "$napk" -gt 0 ] && [ "$draft" = false ]; then
     echo "::notice::The '$tag' release was already built from upstream ${UPSTREAM_SHA:0:7} + builder ${BUILDER_SHA:0:7}; not publishing."
+    exit 0
+  fi
+  current_n=$(jq -r '.name // ""' <<<"$release" | sed -nE 's/^main-([0-9]+)( .*)?$/\1/p')
+  if [ -n "$current_n" ] && [ "$current_n" -gt "${LABEL#main-}" ]; then
+    echo "::notice::The '$tag' release already holds the newer build main-$current_n; not replacing it with $LABEL."
     exit 0
   fi
 else

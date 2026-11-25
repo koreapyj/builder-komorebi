@@ -8,15 +8,13 @@ on:
         type: string
         required: true
       upstream_repo:
-        description: owner/name of the upstream repository
         type: string
         required: true
       upstream_ref:
-        description: full upstream ref to fetch (refs/tags/X or refs/heads/main)
+        description: refs/tags/X or refs/heads/main (informational; upstream_sha is fetched)
         type: string
         required: true
       upstream_sha:
-        description: commit the ref pointed at when the run resolved it (informational)
         type: string
         required: true
       release_tag:
@@ -28,13 +26,16 @@ on:
         type: string
         required: true
       version_name:
-        description: value for -PkomorebiVersionName
         type: string
         required: true
-      publishing:
-        description: true when this run publishes this channel (versionName mismatch is then an error)
-        type: boolean
-        default: false
+      variant:
+        description: release | debug
+        type: string
+        required: true
+      marker:
+        description: name of the build-info artifact that marks this (channel, upstream, builder) as built
+        type: string
+        required: true
     secrets:
       KEYSTORE_BASE64:
         required: false
@@ -44,19 +45,6 @@ on:
         required: false
       KEY_PASSWORD:
         required: false
-    outputs:
-      signed:
-        description: "'true' when the APKs are signed with the release key"
-        value: ${{ jobs.build.outputs.signed }}
-      artifact:
-        description: name of the uploaded workflow artifact
-        value: ${{ jobs.build.outputs.artifact }}
-      upstream_sha:
-        description: upstream commit that was actually built
-        value: ${{ jobs.build.outputs.upstream_sha }}
-      version_check:
-        description: ok | mismatch | n/a (upstream tag X.Y.Z vs upstream versionName)
-        value: ${{ jobs.build.outputs.version_check }}
 
 permissions:
   contents: read
@@ -66,11 +54,6 @@ jobs:
     name: Build ${{ inputs.channel }} (${{ inputs.upstream_ref }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    outputs:
-      signed: ${{ steps.variant.outputs.signed }}
-      artifact: ${{ steps.variant.outputs.artifact }}
-      upstream_sha: ${{ steps.upstream.outputs.sha }}
-      version_check: ${{ steps.version.outputs.version_check }}
     env:
       KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
       KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -84,7 +67,8 @@ jobs:
       RELEASE_TAG: ${{ inputs.release_tag }}
       LABEL: ${{ inputs.label }}
       VERSION_NAME: ${{ inputs.version_name }}
-      PUBLISHING: ${{ inputs.publishing }}
+      VARIANT: ${{ inputs.variant }}
+      BUILDER_SHA: ${{ github.sha }}
       BUILD_NUMBER: ${{ github.run_number }}
 
     steps:
@@ -93,6 +77,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check signing secrets
+        if: inputs.variant == 'release'
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ]; then
+            echo "::error::A release build needs the KEYSTORE_BASE64, KEYSTORE_PASSWORD and KEY_ALIAS secrets"
+            exit 1
+          fi
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -100,51 +92,46 @@ jobs:
           java-version: '17'
 
       - name: Fetch upstream ${{ inputs.upstream_ref }}
-        id: upstream
         run: |
           set -euo pipefail
           git init -q komorebi
           git -C komorebi remote add origin "https://github.com/$UPSTREAM_REPO.git"
-          git -C komorebi fetch -q --depth 1 origin "$UPSTREAM_REF"
+          git -C komorebi fetch -q --depth 1 origin "$UPSTREAM_SHA"
           git -C komorebi checkout -q FETCH_HEAD
           git -C komorebi submodule update --init --recursive --depth 1
-          sha=$(git -C komorebi rev-parse HEAD)
-          if [ "$sha" != "$UPSTREAM_SHA" ]; then
-            echo "::notice::$UPSTREAM_REF moved since it was resolved ($UPSTREAM_SHA -> $sha); building $sha"
-          fi
-          echo "Building upstream $UPSTREAM_REF at $sha"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Building upstream $UPSTREAM_REF at $UPSTREAM_SHA"
 
       # Read before the patches are applied: the version is upstream's.
       - name: Compute version
-        id: version
         run: |
           set -euo pipefail
           tag=""
           if [ -n "$RELEASE_TAG" ]; then tag=${UPSTREAM_REF#refs/tags/}; fi
           out=$(bash .github/scripts/upstream-version.sh komorebi/app/build.gradle.kts "$BUILD_NUMBER" "$tag")
-          echo "$out" >> "$GITHUB_OUTPUT"
           get() { sed -n "s/^$1=//p" <<< "$out"; }
           version_code=$(get version_code)
           version_check=$(get version_check)
-          upstream_version_code=$(get upstream_version_code)
-          upstream_version_name=$(get upstream_version_name)
           if [ "$version_check" = mismatch ]; then
-            msg="upstream tag $tag does not match upstream versionName '$upstream_version_name' (X.Y.Z must be its prefix)"
-            if [ "$PUBLISHING" = true ]; then
-              echo "::error::$msg; refusing to publish $RELEASE_TAG"
-              exit 1
-            fi
-            echo "::warning::$msg (publishing this channel would fail)"
+            echo "::warning::upstream tag $tag does not match upstream versionName '$(get upstream_version_name)' (X.Y.Z must be its prefix); this build cannot be published"
           fi
+          mkdir -p build-info
+          {
+            echo "channel=$CHANNEL"
+            echo "variant=$VARIANT"
+            echo "upstream_sha=$UPSTREAM_SHA"
+            echo "builder_sha=$BUILDER_SHA"
+            echo "release_tag=$RELEASE_TAG"
+            echo "version_name=$VERSION_NAME"
+            echo "$out"
+          } > build-info/build-info.env
           {
             echo "GRADLE_PROPS=-PkomorebiUpdateRepo=$GITHUB_REPOSITORY -PkomorebiUpdateChannel=$CHANNEL" \
               "-PkomorebiReleaseTag=$RELEASE_TAG -PkomorebiBuildNumber=$BUILD_NUMBER" \
               "-PkomorebiVersionCode=$version_code -PkomorebiVersionName=$VERSION_NAME"
           } >> "$GITHUB_ENV"
           {
-            echo "### $CHANNEL: upstream \`${UPSTREAM_REF#refs/*/}\` (\`${{ steps.upstream.outputs.sha }}\`)"
-            echo "versionName \`$VERSION_NAME\`, versionCode \`$version_code\` (upstream $upstream_version_code \"$upstream_version_name\"), version check: $version_check"
+            echo "### $CHANNEL: upstream \`${UPSTREAM_REF#refs/*/}\` (\`$UPSTREAM_SHA\`), $VARIANT build"
+            echo "versionName \`$VERSION_NAME\`, versionCode \`$version_code\` (upstream $(get upstream_version_code) \"$(get upstream_version_name)\"), version check: $version_check"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Apply patches
@@ -196,32 +183,11 @@ jobs:
           read -ra props <<< "$GRADLE_PROPS"
           ./gradlew --no-daemon "${props[@]}" :app:testDebugUnitTest
 
-      - name: Decide variant
-        id: variant
-        run: |
-          set -eu
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            if [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ]; then
-              echo "::error::KEYSTORE_BASE64 is set but KEYSTORE_PASSWORD or KEY_ALIAS is missing"
-              exit 1
-            fi
-            variant=release; signed=true
-          else
-            variant=debug; signed=false
-            echo "::warning::Release signing secrets are not set: building debug-signed APKs; this channel cannot be published"
-          fi
-          {
-            echo "name=$variant"
-            echo "task=assemble${variant^}"
-            echo "signed=$signed"
-            echo "artifact=komorebi-$LABEL-$variant"
-          } >> "$GITHUB_OUTPUT"
-
       # AGP packages the ABI splits in parallel, and each one tries to create
       # ~/.android/debug.keystore when it is missing; on a fresh machine they race
       # and packageDebug fails. Create it up front.
       - name: Create debug keystore
-        if: steps.variant.outputs.name == 'debug'
+        if: inputs.variant == 'debug'
         run: |
           set -eu
           mkdir -p "$HOME/.android"
@@ -236,20 +202,25 @@ jobs:
         working-directory: komorebi
         run: |
           read -ra props <<< "$GRADLE_PROPS"
-          ./gradlew --no-daemon "${props[@]}" ":app:${{ steps.variant.outputs.task }}"
+          ./gradlew --no-daemon "${props[@]}" ":app:assemble${VARIANT^}"
 
       - name: Sign and collect APKs
-        run: >-
-          bash .github/scripts/collect-apks.sh
-          "${{ steps.variant.outputs.name }}"
-          "komorebi/app/build/outputs/apk/${{ steps.variant.outputs.name }}"
-          dist "$LABEL"
+        run: bash .github/scripts/collect-apks.sh "$VARIANT" "komorebi/app/build/outputs/apk/$VARIANT" dist "$LABEL"
 
-      - name: Upload artifact
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.variant.outputs.artifact }}
+          name: apks-${{ inputs.channel }}
           path: dist/*.apk
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Upload build info
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.marker }}
+          path: build-info/build-info.env
           retention-days: 30
           if-no-files-found: error
           overwrite: true

@@ -1,0 +1,149 @@
+name: Release channel
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: stable | beta
+        type: string
+        required: true
+      upstream_repo:
+        type: string
+        required: true
+      upstream_ref:
+        type: string
+        required: true
+      upstream_sha:
+        type: string
+        required: true
+      release_tag:
+        type: string
+        required: true
+      variant:
+        type: string
+        required: true
+      marker:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check ${{ inputs.channel }} can be released
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      ok: ${{ steps.done.outputs.ok }}
+    env:
+      CHANNEL: ${{ inputs.channel }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      UPSTREAM_SHA: ${{ inputs.upstream_sha }}
+      BUILDER_SHA: ${{ github.sha }}
+    steps:
+      - name: Require release-signed APKs
+        if: inputs.variant != 'release'
+        run: |
+          echo "::error::The $CHANNEL build is not signed with the release key (KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS secrets missing); refusing to publish it."
+          exit 1
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Download build info
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.marker }}
+          path: build-info
+
+      - name: Check the build
+        run: |
+          set -euo pipefail
+          get() { sed -n "s/^$1=//p" build-info/build-info.env; }
+          if [ "$(get upstream_sha)" != "$UPSTREAM_SHA" ] || [ "$(get builder_sha)" != "$BUILDER_SHA" ] \
+            || [ "$(get release_tag)" != "$RELEASE_TAG" ]; then
+            echo "::error::build-info.env does not describe this build:"
+            cat build-info/build-info.env
+            exit 1
+          fi
+          if [ "$(get version_check)" != ok ]; then
+            echo "::error::Upstream ${UPSTREAM_REF#refs/tags/} does not match upstream versionName '$(get upstream_version_name)' (X.Y.Z must be its prefix); not releasing $RELEASE_TAG."
+            exit 1
+          fi
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+
+      # An environment that does not exist is created unprotected on first use, which would publish without approval.
+      - name: Check the release-${{ inputs.channel }} environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 -I .github/scripts/ci.py check-environment "release-$CHANNEL"
+
+      - name: Done
+        id: done
+        run: echo "ok=true" >> "$GITHUB_OUTPUT"
+
+  approve:
+    name: Approve ${{ inputs.release_tag }}
+    needs: check
+    if: success() && needs.check.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    environment: release-${{ inputs.channel }}
+    steps:
+      - run: echo "Approved $RELEASE_TAG"
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+
+  # Not in the environment job, so runs waiting for approval do not hold this concurrency group.
+  publish:
+    name: Publish ${{ inputs.release_tag }}
+    needs: [check, approve]
+    if: success() && needs.check.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: ${{ github.workflow }}-publish-${{ inputs.channel }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      CHANNEL: ${{ inputs.channel }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      UPSTREAM_SHA: ${{ inputs.upstream_sha }}
+      UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+      BUILDER_SHA: ${{ github.sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Download APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: apks-${{ inputs.channel }}
+          path: dist
+
+      - name: Refuse to publish over a newer release
+        run: python3 -I .github/scripts/ci.py check-order "$CHANNEL" "$RELEASE_TAG"
+
+      - name: Create the release
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+        run: |
+          export UPSTREAM_TAG=${UPSTREAM_REF#refs/tags/}
+          bash .github/scripts/publish-release.sh dist
