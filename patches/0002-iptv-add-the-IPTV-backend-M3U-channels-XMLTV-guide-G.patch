@@ -778,7 +778,7 @@ index fc6531f..34b02eb 100644
                                      icon = Icons.Default.Delete,
                                      label = "削除する",
 diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerManager.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerManager.kt
-index 7ec316a..fb20061 100644
+index 7ec316a..15820cd 100644
 --- a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerManager.kt
 +++ b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerManager.kt
 @@ -62,6 +62,7 @@ import com.beeregg2001.komorebi.util.TsReadExDataSource
@@ -798,7 +798,17 @@ index 7ec316a..fb20061 100644
  
                      // ★ 修正(再修正): 一度 "0"(フィルタなし)にフォールバックさせたが、KonomiTV
                      // サーバー側(VideoEncodingTask.py)を確認したところ、channelがnull(SDT解析失敗)の
-@@ -267,14 +270,15 @@ fun rememberManagedExoPlayer(
+@@ -259,7 +262,8 @@ fun rememberManagedExoPlayer(
+                     // 元の実装が正しかった。字幕欠落の原因は別にあるため、"-1"に戻す。
+                     // ★ 修正: 初回コンポジション時にキャプチャした古い program ではなく、
+                     // 常に最新の番組のサービスIDを tsreadex へ渡す(上のrememberUpdatedStateのコメント参照)
+-                    val sid = currentProgramState?.channel?.serviceId ?: -1
++                    // IPTV: PATに実在しないサービスが並ぶ録画があるため、検出済みのサービスIDを使う
++                    val sid = if (isIptvDrive) IptvPlayback.serviceId(context, dataSpec.uri) else currentProgramState?.channel?.serviceId ?: -1
+                     val nValue = sid.toString()
+ 
+                     val dynamicTsArgs = arrayOf(
+@@ -267,14 +271,15 @@ fun rememberManagedExoPlayer(
                          "-a", "13", "-b", "5", "-c", "5", "-u", "1", "-d", "13"
                      )
  
@@ -816,7 +826,7 @@ index 7ec316a..fb20061 100644
                              filterStateRef,
                              pendingSeekByteRef
                          )
-@@ -284,6 +288,8 @@ fun rememberManagedExoPlayer(
+@@ -284,6 +289,8 @@ fun rememberManagedExoPlayer(
  
                      transferListeners.forEach { source.addTransferListener(it) }
                      activeDataSource = source
@@ -1219,10 +1229,10 @@ index 0000000..d70803e
 +}
 diff --git a/app/src/main/java/kr/dcmys/komorebi/iptv/IptvDvrClient.kt b/app/src/main/java/kr/dcmys/komorebi/iptv/IptvDvrClient.kt
 new file mode 100644
-index 0000000..f022eaa
+index 0000000..5de6331
 --- /dev/null
 +++ b/app/src/main/java/kr/dcmys/komorebi/iptv/IptvDvrClient.kt
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,337 @@
 +package kr.dcmys.komorebi.iptv
 +
 +import android.os.SystemClock
@@ -1542,6 +1552,9 @@ index 0000000..f022eaa
 +                u.encodedPath.startsWith("/drive/v3/files/") && u.pathSize == 4 &&
 +                u.queryParameter("alt") == "media"
 +        }
++
++        fun fileIdOf(url: String): String? =
++            url.takeIf { isMediaUrl(it) }?.toHttpUrlOrNull()?.pathSegments?.get(3)
 +
 +        private val gson = Gson()
 +
@@ -2344,10 +2357,10 @@ index 0000000..06e9f7f
 +}
 diff --git a/app/src/main/java/kr/dcmys/komorebi/iptv/IptvPlayback.kt b/app/src/main/java/kr/dcmys/komorebi/iptv/IptvPlayback.kt
 new file mode 100644
-index 0000000..be98589
+index 0000000..aabed04
 --- /dev/null
 +++ b/app/src/main/java/kr/dcmys/komorebi/iptv/IptvPlayback.kt
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,57 @@
 +package kr.dcmys.komorebi.iptv
 +
 +import android.content.Context
@@ -2369,6 +2382,7 @@ index 0000000..be98589
 +    @InstallIn(SingletonComponent::class)
 +    interface Deps {
 +        fun iptvDvrClient(): IptvDvrClient
++        fun iptvRecordRepository(): IptvRecordRepository
 +    }
 +
 +    private fun client(context: Context): IptvDvrClient =
@@ -2377,6 +2391,11 @@ index 0000000..be98589
 +    fun isDriveMedia(url: String): Boolean = IptvDvrClient.isMediaUrl(url)
 +
 +    fun isDriveMedia(uri: Uri): Boolean = isDriveMedia(uri.toString())
++
++    /** tsreadex `-n` for a Drive recording: the service actually present in the file, else -1. */
++    fun serviceId(context: Context, uri: Uri): Int =
++        EntryPointAccessors.fromApplication(context.applicationContext, Deps::class.java)
++            .iptvRecordRepository().serviceIdFor(uri.toString())
 +
 +    /**
 +     * Evaluated per DataSource.open(), so every open (start, byte seek, retry) gets a valid token.
@@ -2401,10 +2420,10 @@ index 0000000..be98589
 +}
 diff --git a/app/src/main/java/kr/dcmys/komorebi/iptv/IptvRecordRepository.kt b/app/src/main/java/kr/dcmys/komorebi/iptv/IptvRecordRepository.kt
 new file mode 100644
-index 0000000..e506aea
+index 0000000..1165eaa
 --- /dev/null
 +++ b/app/src/main/java/kr/dcmys/komorebi/iptv/IptvRecordRepository.kt
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,380 @@
 +package kr.dcmys.komorebi.iptv
 +
 +import android.content.Context
@@ -2442,10 +2461,11 @@ index 0000000..e506aea
 + * the file id itself is stored in `airType`, which survives the Room round trip and is read by no screen.
 + *
 + * Duration, best first: PCR probe from this process > Drive's durationMillis > value probed
-+ * earlier (found in Room) > size-based estimate. Probing (two 1 MiB Range reads) only happens for
-+ * a recording the player opened ([getRecordStreamUrl] / [keepAlive], called only by the player);
-+ * card-focus [getRecordedProgram] calls never touch the network for it. Results are written to
-+ * Room because the sync engine's REPLACE upserts would otherwise regress them.
++ * earlier (found in Room) > size-based estimate. Inspection (head + tail Range reads: the recorded
++ * service and the duration) only happens for a recording the player opened ([getRecordStreamUrl] /
++ * [keepAlive], called only by the player); card-focus [getRecordedProgram] calls never touch the
++ * network for it. Durations are written to Room because the sync engine's REPLACE upserts would
++ * otherwise regress them.
 + */
 +@Singleton
 +class IptvRecordRepository @Inject constructor(
@@ -2479,7 +2499,12 @@ index 0000000..e506aea
 +    private var sourceChanged = false
 +
 +    private val probed = ConcurrentHashMap<String, Double>()
-+    private val probes = ConcurrentHashMap<String, Deferred<Double?>>()
++    private val inspections = ConcurrentHashMap<String, Deferred<Unit>>()
++
++    /** Drive file id -> program_number to play, or [NO_SERVICE] when the head showed none. */
++    private val services = ConcurrentHashMap<String, Int>()
++    private val pcrPids = ConcurrentHashMap<String, Int>()
++    private val serviceFailed = ConcurrentHashMap<String, Long>()
 +
 +    /** Drive file id -> monotonic time before which no new probe is tried (failed / timed out). */
 +    private val probeFailed = ConcurrentHashMap<String, Long>()
@@ -2506,8 +2531,11 @@ index 0000000..e506aea
 +                    stateKey = key
 +                    snapshot = null
 +                    probed.clear()
-+                    probes.clear()
++                    inspections.clear()
 +                    probeFailed.clear()
++                    services.clear()
++                    pcrPids.clear()
++                    serviceFailed.clear()
 +                    playing.clear()
 +                }
 +            }
@@ -2589,40 +2617,27 @@ index 0000000..e506aea
 +        probeFailed[fileId] = if (permanent) Long.MAX_VALUE else now() + PROBE_RETRY_MS
 +    }
 +
-+    /** Awaits the probe for [item] for at most [timeoutMs]; a timeout counts as a transient failure. */
-+    private suspend fun awaitProbe(item: Item, timeoutMs: Long) {
-+        val done = withTimeoutOrNull(timeoutMs) { probeAsync(item).await(); true }
-+        if (done == null && !probed.containsKey(item.rec.fileId)) backOff(item.rec.fileId, permanent = false)
++    private fun needsService(fileId: String): Boolean =
++        !services.containsKey(fileId) && (serviceFailed[fileId]?.let { now() < it } != true)
++
++    /** A timeout counts as a transient duration failure; the inspection itself keeps running. */
++    private suspend fun awaitInspection(fileId: String, item: Item?, timeoutMs: Long) {
++        val done = withTimeoutOrNull(timeoutMs) { inspectAsync(fileId, item).await(); true }
++        if (done == null && item != null && !probed.containsKey(fileId)) backOff(fileId, permanent = false)
 +    }
 +
-+    /** Single-flight probe per file; runs in the repository scope so a cancelled caller does not abort it. */
-+    private fun probeAsync(item: Item): Deferred<Double?> {
-+        val fileId = item.rec.fileId
++    /**
++     * Single-flight per file, in the repository scope so a cancelled caller does not abort it.
++     * One head read serves both the service detection and the duration probe.
++     */
++    private fun inspectAsync(fileId: String, item: Item?): Deferred<Unit> {
 +        val key = stateKey
-+        val deferred = probes.computeIfAbsent(fileId) {
++        val deferred = inspections.computeIfAbsent(fileId) {
 +            scope.async(start = CoroutineStart.LAZY) {
 +                try {
-+                    val sec = probeDurationSec(item.rec)
-+                    if (stateKey != key) return@async null // configuration changed meanwhile
-+                    if (sec == null) {
-+                        // No timestamps / tiny file: retrying cannot help.
-+                        backOff(fileId, permanent = true)
-+                    } else {
-+                        probed[fileId] = sec
-+                        probeFailed.remove(fileId)
-+                        recordedProgramDao.getById(item.id)
-+                            ?.takeIf { it.airType == fileId }
-+                            ?.let { recordedProgramDao.upsertAll(listOf(it.withDuration(item.rec, sec))) }
-+                    }
-+                    sec
-+                } catch (e: CancellationException) {
-+                    throw e
-+                } catch (e: Exception) {
-+                    Log.w(TAG, "Duration probe failed: ${e.message}")
-+                    if (stateKey == key) backOff(fileId, permanent = false)
-+                    null
++                    inspect(fileId, item, key)
 +                } finally {
-+                    probes.remove(fileId)
++                    inspections.remove(fileId)
 +                }
 +            }
 +        }
@@ -2630,17 +2645,64 @@ index 0000000..e506aea
 +        return deferred
 +    }
 +
-+    private suspend fun probeDurationSec(rec: DriveRecording): Double? {
-+        val head = dvr.readRange(rec.fileId, 0L, PROBE_BYTES)
++    private suspend fun inspect(fileId: String, item: Item?, key: String?) {
++        val wantService = needsService(fileId)
++        val wantDuration = item?.needsProbe() == true
++        if (!wantService && !wantDuration) return
++        val head = try {
++            dvr.readRange(fileId, 0L, HEAD_BYTES)
++        } catch (e: CancellationException) {
++            throw e
++        } catch (e: Exception) {
++            Log.w(TAG, "Head read failed: ${e.message}")
++            if (stateKey == key) {
++                if (wantService) serviceFailed[fileId] = now() + PROBE_RETRY_MS
++                if (wantDuration) backOff(fileId, permanent = false)
++            }
++            return
++        }
++        if (stateKey != key) return
++        if (wantService) {
++            val service = TsServiceDetector.detect(head.bytes)
++            services[fileId] = service?.programNumber ?: NO_SERVICE
++            service?.pcrPid?.let { pcrPids[fileId] = it }
++        }
++        if (item == null || !wantDuration) return
++        try {
++            val sec = probeDurationSec(item.rec, head)
++            if (stateKey != key) return
++            if (sec == null) {
++                backOff(fileId, permanent = true)
++            } else {
++                probed[fileId] = sec
++                probeFailed.remove(fileId)
++                recordedProgramDao.getById(item.id)
++                    ?.takeIf { it.airType == fileId }
++                    ?.let { recordedProgramDao.upsertAll(listOf(it.withDuration(item.rec, sec))) }
++            }
++        } catch (e: CancellationException) {
++            throw e
++        } catch (e: Exception) {
++            Log.w(TAG, "Duration probe failed: ${e.message}")
++            if (stateKey == key) backOff(fileId, permanent = false)
++        }
++    }
++
++    private suspend fun probeDurationSec(rec: DriveRecording, head: DriveRange): Double? {
 +        val size = head.totalSize ?: rec.sizeBytes
-+        if (size <= PROBE_BYTES * 2L) return null
-+        val tail = dvr.readRange(rec.fileId, size - PROBE_BYTES, PROBE_BYTES)
++        if (size <= HEAD_BYTES + TAIL_BYTES) return null
++        val tail = dvr.readRange(rec.fileId, size - TAIL_BYTES, TAIL_BYTES)
 +        val ms = TsTimestampScanner.estimateDurationMs(
 +            TsTimestampScanner.scan(head.bytes),
 +            TsTimestampScanner.scan(tail.bytes),
++            pcrPid = pcrPids[rec.fileId],
 +        ) ?: return null
 +        return ms / 1000.0
 +    }
++
++    /** tsreadex `-n` for a Drive media URL: the detected program_number, else -1 (first in the PAT). */
++    fun serviceIdFor(url: String): Int =
++        IptvDvrClient.fileIdOf(url)?.let { services[it] }?.takeIf { it > 0 } ?: -1
 +
 +    override suspend fun getRecordedPrograms(page: Int): RecordedApiResponse =
 +        getRecordedPrograms(page, DEFAULT_PAGE_SIZE)
@@ -2672,13 +2734,13 @@ index 0000000..e506aea
 +            // The player marks the recording (keepAlive at screen start) ~300 ms before its detail
 +            // fetch; allow for a late mark so the player never keeps the estimate for the session.
 +            withTimeoutOrNull(MARK_WAIT_MS) {
-+                while (!isPlaying(videoId) && !probes.containsKey(found.rec.fileId)) delay(50)
++                while (!isPlaying(videoId) && !inspections.containsKey(found.rec.fileId)) delay(50)
 +            }
 +        }
 +        when {
 +            found != null -> {
-+                if (found.needsProbe() && (isPlaying(videoId) || probes.containsKey(found.rec.fileId))) {
-+                    awaitProbe(found, PROBE_TIMEOUT_MS)
++                if (found.needsProbe() && (isPlaying(videoId) || inspections.containsKey(found.rec.fileId))) {
++                    awaitInspection(found.rec.fileId, found, PROBE_TIMEOUT_MS)
 +                }
 +                Result.success(found.toProgram())
 +            }
@@ -2707,10 +2769,12 @@ index 0000000..e506aea
 +            ?: (if (!sourceChanged) recordedProgramDao.getById(videoId)?.airType?.takeIf { it.isNotEmpty() } else null)
 +            ?: currentSnapshot()?.byId?.get(videoId)?.also { item = it }?.rec?.fileId
 +            ?: throw IOException("録画番組が見つかりません。")
-+        // First play of a recording with an estimated duration: wait (bounded) for the probe that
-+        // getRecordedProgram() also awaits, so the player's corrected duration is in place before
-+        // the first open — the resume byte seek is computed from it.
-+        item?.takeIf { it.needsProbe() }?.let { awaitProbe(it, STREAM_PROBE_WAIT_MS) }
++        // The player's first open follows: it needs the service id, and the resume byte seek needs
++        // the corrected duration. Bounded; on timeout playback falls back to -1 / the estimate.
++        val wantDuration = item?.needsProbe() == true
++        if (wantDuration || needsService(fileId)) {
++            awaitInspection(fileId, item?.takeIf { wantDuration }, if (wantDuration) STREAM_PROBE_WAIT_MS else SERVICE_WAIT_MS)
++        }
 +        return IptvDvrClient.mediaUrl(fileId)
 +    }
 +
@@ -2730,9 +2794,12 @@ index 0000000..e506aea
 +        const val DEFAULT_PAGE_SIZE = 100
 +        const val SNAPSHOT_TTL_MS = 60_000L
 +        const val PLAYING_WINDOW_MS = 10 * 60_000L
-+        const val PROBE_BYTES = 1024 * 1024
++        const val HEAD_BYTES = 2 * 1024 * 1024
++        const val TAIL_BYTES = 1024 * 1024
++        const val NO_SERVICE = -1
 +        const val PROBE_TIMEOUT_MS = 20_000L
 +        const val STREAM_PROBE_WAIT_MS = 8_000L
++        const val SERVICE_WAIT_MS = 5_000L
 +        const val MARK_WAIT_MS = 500L
 +        const val PROBE_RETRY_MS = 10 * 60_000L
 +    }
@@ -3466,12 +3533,186 @@ index 0000000..480617b
 +        return -1
 +    }
 +}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/iptv/TsServiceDetector.kt b/app/src/main/java/kr/dcmys/komorebi/iptv/TsServiceDetector.kt
+new file mode 100644
+index 0000000..b36be83
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/iptv/TsServiceDetector.kt
+@@ -0,0 +1,168 @@
++package kr.dcmys.komorebi.iptv
++
++/**
++ * Picks the service actually recorded in a TS: recorders may keep one service of a transponder
++ * but leave the full PAT, so "first program in the PAT" (tsreadex `-n -1`) can select nothing.
++ */
++object TsServiceDetector {
++
++    data class Service(val programNumber: Int, val pcrPid: Int?)
++
++    private class Pmt(val programNumber: Int, val pcrPid: Int, val streams: List<Pair<Int, Int>>)
++
++    private val VIDEO_STREAM_TYPES = setOf(0x01, 0x02, 0x1B, 0x24)
++    private const val MAX_SECTION = 4096
++
++    fun detect(data: ByteArray, length: Int = data.size): Service? {
++        val (start, stride) = findPackets(data, length) ?: return null
++
++        val asm = HashMap<Int, ByteArray>()
++        var pat: Map<Int, Int>? = null // program_number -> PMT PID
++        forEachPacket(data, length, start, stride) { pid, unitStart, payload, end ->
++            if (pid == 0 && pat == null) {
++                sectionsOf(asm, 0, unitStart, data, payload, end) { s -> pat = parsePat(s) }
++            }
++        }
++        val programs = pat?.takeIf { it.isNotEmpty() } ?: return null
++        val pmtPids = programs.values.toSet()
++        asm.clear()
++
++        val pmts = HashMap<Int, Pmt>()
++        val counts = HashMap<Int, Int>()
++        forEachPacket(data, length, start, stride) { pid, unitStart, payload, end ->
++            counts[pid] = (counts[pid] ?: 0) + 1
++            if (pid in pmtPids) {
++                sectionsOf(asm, pid, unitStart, data, payload, end) { s ->
++                    val pmt = parsePmt(s) ?: return@sectionsOf
++                    if (programs[pmt.programNumber] == pid) pmts.putIfAbsent(pmt.programNumber, pmt)
++                }
++            }
++        }
++
++        fun videoPackets(p: Pmt) = p.streams.filter { it.first in VIDEO_STREAM_TYPES }.sumOf { counts[it.second] ?: 0 }
++        fun allPackets(p: Pmt) = p.streams.sumOf { counts[it.second] ?: 0 }
++        val best = pmts.values.filter { videoPackets(it) > 0 }.maxWithOrNull(compareBy({ videoPackets(it) }, { -it.programNumber }))
++            ?: pmts.values.filter { allPackets(it) > 0 }.maxWithOrNull(compareBy({ allPackets(it) }, { -it.programNumber }))
++            ?: return null
++        return Service(best.programNumber, best.pcrPid.takeIf { it != 0x1FFF })
++    }
++
++    /** Sync offset and packet size (188 TS, 192 M2TS, 204 with FEC). */
++    private fun findPackets(data: ByteArray, length: Int): Pair<Int, Int>? {
++        for (stride in intArrayOf(188, 192, 204)) {
++            val runs = 5
++            for (start in 0 until minOf(stride, length - stride * (runs - 1))) {
++                if ((0 until runs).all { data[start + it * stride] == 0x47.toByte() }) return start to stride
++            }
++        }
++        return null
++    }
++
++    private inline fun forEachPacket(
++        d: ByteArray,
++        length: Int,
++        start: Int,
++        stride: Int,
++        block: (pid: Int, unitStart: Boolean, payload: Int, end: Int) -> Unit,
++    ) {
++        var p = start
++        while (p + 188 <= length) {
++            if (d[p] == 0x47.toByte()) {
++                val b1 = d[p + 1].toInt() and 0xFF
++                val afc = (d[p + 3].toInt() shr 4) and 0x03
++                if (b1 and 0x80 == 0 && afc and 0x01 != 0) {
++                    val pid = ((b1 and 0x1F) shl 8) or (d[p + 2].toInt() and 0xFF)
++                    val payload = if (afc and 0x02 != 0) p + 5 + (d[p + 4].toInt() and 0xFF) else p + 4
++                    if (payload < p + 188) block(pid, b1 and 0x40 != 0, payload, p + 188)
++                }
++            }
++            p += stride
++        }
++    }
++
++    /** Reassembles PSI sections on [pid]; delivers each complete section with a valid CRC. */
++    private inline fun sectionsOf(
++        reassembly: HashMap<Int, ByteArray>,
++        pid: Int,
++        unitStart: Boolean,
++        d: ByteArray,
++        payload: Int,
++        end: Int,
++        onSection: (ByteArray) -> Unit,
++    ) {
++        var pos = payload
++        var buf = reassembly[pid]
++        if (unitStart) {
++            val pointer = d[pos].toInt() and 0xFF
++            pos += 1
++            if (buf != null && pos + pointer <= end) buf += d.copyOfRange(pos, pos + pointer)
++            buf?.let { completeSection(it)?.let(onSection) }
++            pos += pointer
++            buf = if (pos < end) d.copyOfRange(pos, end) else null
++        } else {
++            buf = buf?.plus(d.copyOfRange(pos, end))
++        }
++        // Several sections may follow each other in one payload.
++        while (buf != null && buf.size >= 3 && buf[0] != 0xFF.toByte()) {
++            val total = 3 + (((buf[1].toInt() and 0x0F) shl 8) or (buf[2].toInt() and 0xFF))
++            if (total > MAX_SECTION) {
++                buf = null
++                break
++            }
++            if (buf.size < total) break
++            completeSection(buf.copyOfRange(0, total))?.let(onSection)
++            buf = buf.copyOfRange(total, buf.size)
++        }
++        if (buf == null || buf.isEmpty() || buf[0] == 0xFF.toByte() || buf.size > MAX_SECTION) reassembly.remove(pid)
++        else reassembly[pid] = buf
++    }
++
++    private fun completeSection(buf: ByteArray): ByteArray? {
++        if (buf.size < 3) return null
++        val total = 3 + (((buf[1].toInt() and 0x0F) shl 8) or (buf[2].toInt() and 0xFF))
++        if (total < 12 || buf.size < total) return null
++        val s = buf.copyOfRange(0, total)
++        return s.takeIf { crc32(it) == 0 }
++    }
++
++    private fun parsePat(s: ByteArray): Map<Int, Int>? {
++        if (s[0].toInt() != 0x00) return null
++        val out = LinkedHashMap<Int, Int>()
++        var i = 8
++        while (i + 4 <= s.size - 4) {
++            val pn = ((s[i].toInt() and 0xFF) shl 8) or (s[i + 1].toInt() and 0xFF)
++            val pid = ((s[i + 2].toInt() and 0x1F) shl 8) or (s[i + 3].toInt() and 0xFF)
++            if (pn != 0) out[pn] = pid
++            i += 4
++        }
++        return out
++    }
++
++    private fun parsePmt(s: ByteArray): Pmt? {
++        if (s[0].toInt() != 0x02 || s.size < 16) return null
++        val pn = ((s[3].toInt() and 0xFF) shl 8) or (s[4].toInt() and 0xFF)
++        val pcrPid = ((s[8].toInt() and 0x1F) shl 8) or (s[9].toInt() and 0xFF)
++        val infoLen = ((s[10].toInt() and 0x0F) shl 8) or (s[11].toInt() and 0xFF)
++        val streams = ArrayList<Pair<Int, Int>>()
++        var i = 12 + infoLen
++        val end = s.size - 4
++        while (i + 5 <= end) {
++            val type = s[i].toInt() and 0xFF
++            val pid = ((s[i + 1].toInt() and 0x1F) shl 8) or (s[i + 2].toInt() and 0xFF)
++            val esLen = ((s[i + 3].toInt() and 0x0F) shl 8) or (s[i + 4].toInt() and 0xFF)
++            streams += type to pid
++            i += 5 + esLen
++        }
++        return Pmt(pn, pcrPid, streams)
++    }
++
++    /** MPEG-2 CRC32 over a whole section including its CRC: 0 when intact. */
++    internal fun crc32(s: ByteArray): Int {
++        var crc = -1
++        for (b in s) {
++            crc = crc xor ((b.toInt() and 0xFF) shl 24)
++            repeat(8) { crc = if (crc < 0) (crc shl 1) xor 0x04C11DB7 else crc shl 1 }
++        }
++        return crc
++    }
++}
 diff --git a/app/src/main/java/kr/dcmys/komorebi/iptv/TsTimestampScanner.kt b/app/src/main/java/kr/dcmys/komorebi/iptv/TsTimestampScanner.kt
 new file mode 100644
-index 0000000..a61d002
+index 0000000..5623734
 --- /dev/null
 +++ b/app/src/main/java/kr/dcmys/komorebi/iptv/TsTimestampScanner.kt
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,136 @@
 +package kr.dcmys.komorebi.iptv
 +
 +/** All clock values are 33-bit, 90 kHz (the PCR base; the 27 MHz extension is ignored). */
@@ -3586,17 +3827,25 @@ index 0000000..a61d002
 +    /** Handles one wraparound. */
 +    fun clockDiff(from: Long, to: Long): Long = Math.floorMod(to - from, CLOCK_WRAP)
 +
-+    /** Prefers the PCR of the head's most frequent PCR PID that also occurs in the tail, else PES PTS of a common PID. */
-+    fun estimateDurationMs(head: ChunkTimestamps, tail: ChunkTimestamps, maxMs: Long = 24L * 3600_000L): Long? {
-+        fun pick(h: Map<Int, PidClock>, t: Map<Int, PidClock>): Long? {
-+            val pid = h.entries
++    /**
++     * Uses [pcrPid] (the recorded service's) when it occurs in both chunks, else the head's most
++     * frequent PCR PID that also occurs in the tail, else PES PTS of a common PID.
++     */
++    fun estimateDurationMs(
++        head: ChunkTimestamps,
++        tail: ChunkTimestamps,
++        maxMs: Long = 24L * 3600_000L,
++        pcrPid: Int? = null,
++    ): Long? {
++        fun pick(h: Map<Int, PidClock>, t: Map<Int, PidClock>, preferred: Int?): Long? {
++            val pid = preferred?.takeIf { it in h && it in t } ?: h.entries
 +                .filter { t.containsKey(it.key) }
 +                .maxByOrNull { it.value.count }
 +                ?.key ?: return null
 +            val ticks = clockDiff(h.getValue(pid).first, t.getValue(pid).last)
 +            return ticks * 1000L / CLOCK_HZ
 +        }
-+        val candidates = listOfNotNull(pick(head.pcr, tail.pcr), pick(head.pts, tail.pts))
++        val candidates = listOfNotNull(pick(head.pcr, tail.pcr, pcrPid), pick(head.pts, tail.pts, null))
 +        return candidates.firstOrNull { it in 1000L..maxMs }
 +    }
 +}
@@ -4602,12 +4851,183 @@ index 0000000..1d991f8
 +        assertEquals("a b", attrs["tvg-id"])
 +    }
 +}
+diff --git a/app/src/test/java/kr/dcmys/komorebi/iptv/TsServiceDetectorTest.kt b/app/src/test/java/kr/dcmys/komorebi/iptv/TsServiceDetectorTest.kt
+new file mode 100644
+index 0000000..31300ee
+--- /dev/null
++++ b/app/src/test/java/kr/dcmys/komorebi/iptv/TsServiceDetectorTest.kt
+@@ -0,0 +1,165 @@
++package kr.dcmys.komorebi.iptv
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++import java.io.ByteArrayOutputStream
++
++class TsServiceDetectorTest {
++
++    private fun withCrc(body: ByteArray): ByteArray {
++        val withZero = body + ByteArray(4)
++        // CRC over body only; append big-endian.
++        var crc = -1
++        for (b in body) {
++            crc = crc xor ((b.toInt() and 0xFF) shl 24)
++            repeat(8) { crc = if (crc < 0) (crc shl 1) xor 0x04C11DB7 else crc shl 1 }
++        }
++        withZero[body.size] = (crc ushr 24).toByte()
++        withZero[body.size + 1] = (crc ushr 16).toByte()
++        withZero[body.size + 2] = (crc ushr 8).toByte()
++        withZero[body.size + 3] = crc.toByte()
++        return withZero
++    }
++
++    private fun section(tableId: Int, idExt: Int, payload: ByteArray): ByteArray {
++        val len = 5 + payload.size + 4
++        val head = byteArrayOf(
++            tableId.toByte(), (0xB0 or (len shr 8)).toByte(), len.toByte(),
++            (idExt shr 8).toByte(), idExt.toByte(), 0xC1.toByte(), 0, 0,
++        )
++        return withCrc(head + payload)
++    }
++
++    private fun pat(vararg programs: Pair<Int, Int>): ByteArray {
++        val out = ByteArrayOutputStream()
++        for ((pn, pid) in listOf(0 to 0x10) + programs) {
++            out.write(pn shr 8); out.write(pn); out.write(0xE0 or (pid shr 8)); out.write(pid)
++        }
++        return section(0x00, 1, out.toByteArray())
++    }
++
++    private fun pmt(pn: Int, pcrPid: Int, vararg streams: Pair<Int, Int>): ByteArray {
++        val out = ByteArrayOutputStream()
++        out.write(0xE0 or (pcrPid shr 8)); out.write(pcrPid); out.write(0xF0); out.write(0)
++        for ((type, pid) in streams) {
++            out.write(type); out.write(0xE0 or (pid shr 8)); out.write(pid); out.write(0xF0); out.write(0)
++        }
++        return section(0x02, pn, out.toByteArray())
++    }
++
++    private fun psiPacket(pid: Int, section: ByteArray): ByteArray {
++        val p = ByteArray(188) { 0xFF.toByte() }
++        p[0] = 0x47; p[1] = (0x40 or (pid shr 8)).toByte(); p[2] = pid.toByte(); p[3] = 0x10
++        p[4] = 0
++        section.copyInto(p, 5)
++        return p
++    }
++
++    private fun esPacket(pid: Int): ByteArray {
++        val p = ByteArray(188)
++        p[0] = 0x47; p[1] = (pid shr 8).toByte(); p[2] = pid.toByte(); p[3] = 0x10
++        return p
++    }
++
++    private fun ts(vararg packets: ByteArray, junk: Int = 0): ByteArray {
++        val out = ByteArrayOutputStream()
++        repeat(junk) { out.write(0x5A) }
++        packets.forEach { out.write(it) }
++        return out.toByteArray()
++    }
++
++    private fun repeat(n: Int, p: ByteArray) = Array(n) { p }
++
++    @Test
++    fun singleService() {
++        val data = ts(
++            psiPacket(0, pat(1040 to 0x1F0)),
++            psiPacket(0x1F0, pmt(1040, 0x100, 0x02 to 0x100, 0x0F to 0x110)),
++            *repeat(10, esPacket(0x100)), esPacket(0x110),
++            junk = 77,
++        )
++        assertEquals(TsServiceDetector.Service(1040, 0x100), TsServiceDetector.detect(data))
++    }
++
++    @Test
++    fun atxShapeOnlyFifthProgramPresent() {
++        val data = ts(
++            psiPacket(0, pat(290 to 0x40E, 311 to 0x401, 316 to 0x402, 321 to 0x404, 333 to 0x40F, 353 to 0x405)),
++            *repeat(3, esPacket(0x1FFF)),
++            psiPacket(0x40F, pmt(333, 0x100F, 0x02 to 0x100F, 0x0F to 0x104F, 0x06 to 0x120F)),
++            *repeat(20, esPacket(0x100F)), *repeat(5, esPacket(0x104F)),
++        )
++        assertEquals(TsServiceDetector.Service(333, 0x100F), TsServiceDetector.detect(data))
++    }
++
++    @Test
++    fun picksProgramWithMostVideoPackets() {
++        val data = ts(
++            psiPacket(0, pat(1040 to 0x1F0, 1041 to 0x1F1)),
++            psiPacket(0x1F0, pmt(1040, 0x100, 0x1B to 0x100)),
++            psiPacket(0x1F1, pmt(1041, 0x200, 0x02 to 0x200)),
++            *repeat(3, esPacket(0x100)), *repeat(9, esPacket(0x200)),
++        )
++        assertEquals(1041, TsServiceDetector.detect(data)?.programNumber)
++    }
++
++    @Test
++    fun audioOnlyProgramWhenNoVideo() {
++        val data = ts(
++            psiPacket(0, pat(1 to 0x1F0, 2 to 0x1F1)),
++            psiPacket(0x1F0, pmt(1, 0x1FFF, 0x0F to 0x110)),
++            psiPacket(0x1F1, pmt(2, 0x1FFF, 0x0F to 0x111)),
++            *repeat(2, esPacket(0x110)), *repeat(4, esPacket(0x111)),
++        )
++        assertEquals(TsServiceDetector.Service(2, null), TsServiceDetector.detect(data))
++    }
++
++    @Test
++    fun patOnlyGivesNull() {
++        val data = ts(psiPacket(0, pat(290 to 0x40E, 333 to 0x40F)), *repeat(10, esPacket(0x1FFF)))
++        assertNull(TsServiceDetector.detect(data))
++    }
++
++    @Test
++    fun corruptSectionIsIgnored() {
++        val bad = pmt(333, 0x100F, 0x02 to 0x100F).also { it[14] = 0x55 }
++        val data = ts(psiPacket(0, pat(333 to 0x40F)), psiPacket(0x40F, bad), *repeat(10, esPacket(0x100F)))
++        assertNull(TsServiceDetector.detect(data))
++    }
++
++    @Test
++    fun sectionSpanningTwoPackets() {
++        val streams = Array(40) { 0x06 to (0x300 + it) } + arrayOf(0x02 to 0x100)
++        val sec = pmt(7, 0x100, *streams) // > 183 bytes
++        val first = ByteArray(188) { 0xFF.toByte() }.also {
++            it[0] = 0x47; it[1] = 0x41; it[2] = 0xF0.toByte(); it[3] = 0x10; it[4] = 0
++            sec.copyInto(it, 5, 0, 183)
++        }
++        val second = ByteArray(188) { 0xFF.toByte() }.also {
++            it[0] = 0x47; it[1] = 0x01; it[2] = 0xF0.toByte(); it[3] = 0x11
++            sec.copyInto(it, 4, 183, sec.size)
++        }
++        val data = ts(psiPacket(0, pat(7 to 0x1F0)), first, second, *repeat(4, esPacket(0x100)))
++        assertEquals(7, TsServiceDetector.detect(data)?.programNumber)
++    }
++
++    @Test
++    fun garbageAndShortInput() {
++        assertNull(TsServiceDetector.detect(ByteArray(0)))
++        assertNull(TsServiceDetector.detect(ByteArray(500) { 0x47 }))
++        assertNull(TsServiceDetector.detect(ByteArray(100_000) { (it * 31).toByte() }))
++        assertNull(TsServiceDetector.detect(ts(psiPacket(0, pat(1 to 0x1F0))).copyOf(100)))
++    }
++
++    @Test
++    fun m2tsPackets() {
++        val packets = listOf(
++            psiPacket(0, pat(5 to 0x1F0)),
++            psiPacket(0x1F0, pmt(5, 0x100, 0x1B to 0x100)),
++        ) + List(6) { esPacket(0x100) }
++        val out = ByteArrayOutputStream()
++        packets.forEach { out.write(ByteArray(4)); out.write(it) }
++        assertEquals(5, TsServiceDetector.detect(out.toByteArray())?.programNumber)
++    }
++}
 diff --git a/app/src/test/java/kr/dcmys/komorebi/iptv/TsTimestampScannerTest.kt b/app/src/test/java/kr/dcmys/komorebi/iptv/TsTimestampScannerTest.kt
 new file mode 100644
-index 0000000..54494a3
+index 0000000..e8bb857
 --- /dev/null
 +++ b/app/src/test/java/kr/dcmys/komorebi/iptv/TsTimestampScannerTest.kt
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,131 @@
 +package kr.dcmys.komorebi.iptv
 +
 +import org.junit.Assert.assertEquals
@@ -4710,6 +5130,19 @@ index 0000000..54494a3
 +            chunk(pcrPacket(0x100, 90_000L * 7), pcrPacket(0x200, 500_000L + 90_000L * 60), nullPacket())
 +        )
 +        assertEquals(60_000L, TsTimestampScanner.estimateDurationMs(head, tail))
++    }
++
++    @Test
++    fun prefersGivenPcrPid() {
++        val head = TsTimestampScanner.scan(
++            chunk(pcrPacket(0x100, 0L), pcrPacket(0x200, 500_000L), pcrPacket(0x200, 500_100L), nullPacket())
++        )
++        val tail = TsTimestampScanner.scan(
++            chunk(pcrPacket(0x100, 90_000L * 7), pcrPacket(0x200, 500_000L + 90_000L * 60), nullPacket())
++        )
++        assertEquals(7_000L, TsTimestampScanner.estimateDurationMs(head, tail, pcrPid = 0x100))
++        // A PCR PID absent from the tail falls back to the most frequent common one.
++        assertEquals(60_000L, TsTimestampScanner.estimateDurationMs(head, tail, pcrPid = 0x300))
 +    }
 +
 +    @Test
