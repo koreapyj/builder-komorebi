@@ -1,0 +1,5 @@
+.claude
+.ref
+.tmp
+__pycache__/
+/src/

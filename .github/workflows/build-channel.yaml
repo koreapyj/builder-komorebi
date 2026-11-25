@@ -1,0 +1,255 @@
+name: Build channel
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: stable | beta | main
+        type: string
+        required: true
+      upstream_repo:
+        description: owner/name of the upstream repository
+        type: string
+        required: true
+      upstream_ref:
+        description: full upstream ref to fetch (refs/tags/X or refs/heads/main)
+        type: string
+        required: true
+      upstream_sha:
+        description: commit the ref pointed at when the run resolved it (informational)
+        type: string
+        required: true
+      release_tag:
+        description: this repo's release tag (stable/beta), empty for main
+        type: string
+        default: ''
+      label:
+        description: asset label (the release tag, or main-<n>)
+        type: string
+        required: true
+      version_name:
+        description: value for -PkomorebiVersionName
+        type: string
+        required: true
+      publishing:
+        description: true when this run publishes this channel (versionName mismatch is then an error)
+        type: boolean
+        default: false
+    secrets:
+      KEYSTORE_BASE64:
+        required: false
+      KEYSTORE_PASSWORD:
+        required: false
+      KEY_ALIAS:
+        required: false
+      KEY_PASSWORD:
+        required: false
+    outputs:
+      signed:
+        description: "'true' when the APKs are signed with the release key"
+        value: ${{ jobs.build.outputs.signed }}
+      artifact:
+        description: name of the uploaded workflow artifact
+        value: ${{ jobs.build.outputs.artifact }}
+      upstream_sha:
+        description: upstream commit that was actually built
+        value: ${{ jobs.build.outputs.upstream_sha }}
+      version_check:
+        description: ok | mismatch | n/a (upstream tag X.Y.Z vs upstream versionName)
+        value: ${{ jobs.build.outputs.version_check }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ inputs.channel }} (${{ inputs.upstream_ref }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      signed: ${{ steps.variant.outputs.signed }}
+      artifact: ${{ steps.variant.outputs.artifact }}
+      upstream_sha: ${{ steps.upstream.outputs.sha }}
+      version_check: ${{ steps.version.outputs.version_check }}
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      # Optional: PKCS12 keystores (keytool's default) use the keystore password for the key too.
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || secrets.KEYSTORE_PASSWORD }}
+      CHANNEL: ${{ inputs.channel }}
+      UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+      UPSTREAM_REF: ${{ inputs.upstream_ref }}
+      UPSTREAM_SHA: ${{ inputs.upstream_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      LABEL: ${{ inputs.label }}
+      VERSION_NAME: ${{ inputs.version_name }}
+      PUBLISHING: ${{ inputs.publishing }}
+      BUILD_NUMBER: ${{ github.run_number }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Fetch upstream ${{ inputs.upstream_ref }}
+        id: upstream
+        run: |
+          set -euo pipefail
+          git init -q komorebi
+          git -C komorebi remote add origin "https://github.com/$UPSTREAM_REPO.git"
+          git -C komorebi fetch -q --depth 1 origin "$UPSTREAM_REF"
+          git -C komorebi checkout -q FETCH_HEAD
+          git -C komorebi submodule update --init --recursive --depth 1
+          sha=$(git -C komorebi rev-parse HEAD)
+          if [ "$sha" != "$UPSTREAM_SHA" ]; then
+            echo "::notice::$UPSTREAM_REF moved since it was resolved ($UPSTREAM_SHA -> $sha); building $sha"
+          fi
+          echo "Building upstream $UPSTREAM_REF at $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # Read before the patches are applied: the version is upstream's.
+      - name: Compute version
+        id: version
+        run: |
+          set -euo pipefail
+          tag=""
+          if [ -n "$RELEASE_TAG" ]; then tag=${UPSTREAM_REF#refs/tags/}; fi
+          out=$(bash .github/scripts/upstream-version.sh komorebi/app/build.gradle.kts "$BUILD_NUMBER" "$tag")
+          echo "$out" >> "$GITHUB_OUTPUT"
+          get() { sed -n "s/^$1=//p" <<< "$out"; }
+          version_code=$(get version_code)
+          version_check=$(get version_check)
+          upstream_version_code=$(get upstream_version_code)
+          upstream_version_name=$(get upstream_version_name)
+          if [ "$version_check" = mismatch ]; then
+            msg="upstream tag $tag does not match upstream versionName '$upstream_version_name' (X.Y.Z must be its prefix)"
+            if [ "$PUBLISHING" = true ]; then
+              echo "::error::$msg; refusing to publish $RELEASE_TAG"
+              exit 1
+            fi
+            echo "::warning::$msg (publishing this channel would fail)"
+          fi
+          {
+            echo "GRADLE_PROPS=-PkomorebiUpdateRepo=$GITHUB_REPOSITORY -PkomorebiUpdateChannel=$CHANNEL" \
+              "-PkomorebiReleaseTag=$RELEASE_TAG -PkomorebiBuildNumber=$BUILD_NUMBER" \
+              "-PkomorebiVersionCode=$version_code -PkomorebiVersionName=$VERSION_NAME"
+          } >> "$GITHUB_ENV"
+          {
+            echo "### $CHANNEL: upstream \`${UPSTREAM_REF#refs/*/}\` (\`${{ steps.upstream.outputs.sha }}\`)"
+            echo "versionName \`$VERSION_NAME\`, versionCode \`$version_code\` (upstream $upstream_version_code \"$upstream_version_name\"), version check: $version_check"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply patches
+        run: |
+          set -euo pipefail
+          git -C komorebi config user.name "builder-komorebi"
+          git -C komorebi config user.email "builder@users.noreply.github.com"
+          shopt -s nullglob
+          patches=("$GITHUB_WORKSPACE"/patches/*.patch)
+          if [ "${#patches[@]}" -eq 0 ]; then
+            echo "::error::No patches found in patches/"
+            exit 1
+          fi
+          # glob order (NNNN- prefix) is the series order
+          if ! git -C komorebi am "${patches[@]}"; then
+            echo "::error::The patch series does not apply to upstream $UPSTREAM_REF ($CHANNEL channel)"
+            git -C komorebi am --show-current-patch=diff | head -n 40 || true
+            exit 1
+          fi
+
+      - name: Prepare fonts
+        working-directory: komorebi
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/res/font
+          for w in thin light regular medium semibold bold; do
+            cp "app/src/main/assets/fonts/notosansjp_${w}.ttf" "app/src/main/res/font/notosansjp_${w}.ttf"
+          done
+          # a binary cannot live in a text patch
+          cp "$GITHUB_WORKSPACE/fonts/WLCMARU2004ARIBU.TTF" app/src/main/assets/fonts/WLCMARU2004ARIBU.TTF
+
+      - name: Install Android SDK components
+        run: |
+          set -eu
+          sdkmanager=$(ls "$ANDROID_HOME"/cmdline-tools/latest/bin/sdkmanager 2>/dev/null || command -v sdkmanager)
+          yes | "$sdkmanager" --licenses >/dev/null || true
+          # the NDK is not pinned by the app; AGP auto-installs its default
+          "$sdkmanager" "platforms;android-35" "platforms;android-36" \
+            "build-tools;35.0.0" "cmake;3.30.5" >/dev/null
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+
+      - name: Unit tests
+        working-directory: komorebi
+        run: |
+          read -ra props <<< "$GRADLE_PROPS"
+          ./gradlew --no-daemon "${props[@]}" :app:testDebugUnitTest
+
+      - name: Decide variant
+        id: variant
+        run: |
+          set -eu
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            if [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ]; then
+              echo "::error::KEYSTORE_BASE64 is set but KEYSTORE_PASSWORD or KEY_ALIAS is missing"
+              exit 1
+            fi
+            variant=release; signed=true
+          else
+            variant=debug; signed=false
+            echo "::warning::Release signing secrets are not set: building debug-signed APKs; this channel cannot be published"
+          fi
+          {
+            echo "name=$variant"
+            echo "task=assemble${variant^}"
+            echo "signed=$signed"
+            echo "artifact=komorebi-$LABEL-$variant"
+          } >> "$GITHUB_OUTPUT"
+
+      # AGP packages the ABI splits in parallel, and each one tries to create
+      # ~/.android/debug.keystore when it is missing; on a fresh machine they race
+      # and packageDebug fails. Create it up front.
+      - name: Create debug keystore
+        if: steps.variant.outputs.name == 'debug'
+        run: |
+          set -eu
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair -keystore "$HOME/.android/debug.keystore" \
+              -storepass android -keypass android -alias androiddebugkey \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              -keyalg RSA -keysize 2048 -validity 10950
+          fi
+
+      - name: Build APKs
+        working-directory: komorebi
+        run: |
+          read -ra props <<< "$GRADLE_PROPS"
+          ./gradlew --no-daemon "${props[@]}" ":app:${{ steps.variant.outputs.task }}"
+
+      - name: Sign and collect APKs
+        run: >-
+          bash .github/scripts/collect-apks.sh
+          "${{ steps.variant.outputs.name }}"
+          "komorebi/app/build/outputs/apk/${{ steps.variant.outputs.name }}"
+          dist "$LABEL"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.variant.outputs.artifact }}
+          path: dist/*.apk
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true

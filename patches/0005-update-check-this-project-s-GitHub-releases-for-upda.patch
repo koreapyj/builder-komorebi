@@ -1,0 +1,593 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yoonji Park <koreapyj@dcmys.kr>
+Date: Wed, 25 Nov 2026 15:33:44 +0900
+Subject: [PATCH] update: check this project's GitHub releases for updates
+
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 2bfc423..3743e7c 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -28,6 +28,16 @@ android {
+         targetSdk = 34
+         versionCode = 19 // 数値を1つ上げる
+         versionName = "1.1.1-Stable"
++        // CI passes -PkomorebiXxx; unset means the updater is disabled
++        providers.gradleProperty("komorebiVersionCode").orNull?.let { versionCode = it.trim().toInt() }
++        providers.gradleProperty("komorebiVersionName").orNull?.let { versionName = it.trim() }
++        fun quoted(name: String) = "\"" + providers.gradleProperty(name).getOrElse("").trim()
++            .replace("\\", "\\\\").replace("\"", "\\\"") + "\""
++        buildConfigField("String", "UPDATE_REPO", quoted("komorebiUpdateRepo"))
++        buildConfigField("String", "UPDATE_CHANNEL", quoted("komorebiUpdateChannel"))
++        buildConfigField("String", "UPDATE_TAG", quoted("komorebiReleaseTag"))
++        buildConfigField("int", "UPDATE_BUILD_NUMBER",
++            providers.gradleProperty("komorebiBuildNumber").getOrElse("0").trim().toInt().toString())
+ 
+         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+ 
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/util/AppUpdater.kt b/app/src/main/java/com/beeregg2001/komorebi/util/AppUpdater.kt
+index 41e7e9e..6684803 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/util/AppUpdater.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/util/AppUpdater.kt
+@@ -21,6 +21,7 @@ import java.io.File
+ import java.io.FileOutputStream
+ import javax.inject.Inject
+ import javax.inject.Singleton
++import kr.dcmys.komorebi.update.GithubReleaseUpdater
+ 
+ sealed class UpdateState {
+     object Idle : UpdateState()
+@@ -45,47 +46,16 @@ class AppUpdater @Inject constructor(
+ 
+     private val client = OkHttpClient()
+ 
+-    // ★ご自身のGitHubのversion.jsonのRaw URLに書き換えてください
+-    private val versionJsonUrl =
+-        "https://raw.githubusercontent.com/BeerEgg2001/Komorebi/main/version.json"
+-
+     // ★ 修正: 引数に receiveBetaUpdates フラグを追加し、デフォルトは false (Stable) とする
+-    suspend fun checkForUpdates(receiveBetaUpdates: Boolean = false) = withContext(Dispatchers.IO) {
++    suspend fun checkForUpdates(receiveBetaUpdates: Boolean = false, manual: Boolean = false) = withContext(Dispatchers.IO) {
+         _updateState.value = UpdateState.Checking
+-        try {
+-            val request = Request.Builder().url(versionJsonUrl).build()
+-            val response = client.newCall(request).execute()
+-
+-            if (response.isSuccessful) {
+-                val jsonString = response.body?.string() ?: return@withContext
+-                val rootJson = JSONObject(jsonString)
+-
+-                // ★ 修正: ベータ版の受信が有効で、かつJSON内に "beta" オブジェクトが定義されていればそちらをパースする
+-                val targetJson = if (receiveBetaUpdates && rootJson.has("beta")) {
+-                    rootJson.getJSONObject("beta")
+-                } else {
+-                    rootJson
+-                }
+-
+-                val latestVersionCode = targetJson.getInt("versionCode")
+-                val latestVersionName = targetJson.getString("versionName")
+-                val releaseNotes = targetJson.getString("releaseNotes")
+-                val apkUrl = targetJson.getString("apkUrl")
+-
+-                val currentVersionCode = getCurrentVersionCode()
+-
+-                if (latestVersionCode > currentVersionCode) {
+-                    _updateState.value =
+-                        UpdateState.UpdateAvailable(latestVersionName, releaseNotes, apkUrl)
+-                } else {
+-                    _updateState.value = UpdateState.Idle
+-                }
+-            } else {
+-                _updateState.value = UpdateState.Error("アップデート情報の取得に失敗しました")
+-            }
+-        } catch (e: Exception) {
+-            Log.e("AppUpdater", "Update check failed", e)
+-            _updateState.value = UpdateState.Error("ネットワークエラーが発生しました")
++        _updateState.value = when (val r = GithubReleaseUpdater.check(client, receiveBetaUpdates)) {
++            is GithubReleaseUpdater.Result.Available ->
++                UpdateState.UpdateAvailable(r.offer.versionName, r.offer.releaseNotes, r.offer.apkUrl)
++            is GithubReleaseUpdater.Result.Failed -> UpdateState.Error(r.message)
++            GithubReleaseUpdater.Result.Disabled ->
++                if (manual) UpdateState.Error("このビルドではアップデート確認は利用できません") else UpdateState.Idle
++            GithubReleaseUpdater.Result.UpToDate -> UpdateState.Idle
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/viewmodel/SettingsViewModel.kt b/app/src/main/java/com/beeregg2001/komorebi/viewmodel/SettingsViewModel.kt
+index 6708a4b..a66f0b5 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/viewmodel/SettingsViewModel.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/viewmodel/SettingsViewModel.kt
+@@ -356,7 +356,7 @@ class SettingsViewModel @Inject constructor(
+     fun checkForUpdatesManually() {
+         viewModelScope.launch {
+             val receiveBeta = settingsRepository.receiveBetaUpdates.first()
+-            appUpdater.checkForUpdates(receiveBetaUpdates = receiveBeta)
++            appUpdater.checkForUpdates(receiveBetaUpdates = receiveBeta, manual = true)
+             _hasManuallyCheckedForUpdate.value = true
+         }
+     }
+@@ -674,6 +674,16 @@ class SettingsViewModel @Inject constructor(
+         forceSyncStreamQualities()
+     }
+ 
++    // IPTV: config.json の URL が変わったら録画一覧(DVR)も変わるため全同期をかけ直す
++    fun updateIptvConfigUrl(url: String) = viewModelScope.launch(Dispatchers.IO) {
++        val newUrl = url.replace(Regex("\\s+"), "")
++        val oldUrl = settingsRepository.iptvConfigUrl.first()
++        settingsRepository.saveString(SettingsRepository.IPTV_CONFIG_URL, newUrl)
++        if (oldUrl.isNotBlank() && oldUrl != newUrl) {
++            syncEngine.launchSyncAllRecords(forceFullSync = true)
++        }
++    }
++
+     fun updateMirakurunIp(ip: String) {
+         viewModelScope.launch(Dispatchers.IO) {
+             settingsRepository.saveString(
+diff --git a/app/src/main/java/kr/dcmys/komorebi/update/GithubReleaseUpdater.kt b/app/src/main/java/kr/dcmys/komorebi/update/GithubReleaseUpdater.kt
+new file mode 100644
+index 0000000..9ef1a9e
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/update/GithubReleaseUpdater.kt
+@@ -0,0 +1,80 @@
++package kr.dcmys.komorebi.update
++
++import android.os.Build
++import android.util.Log
++import com.beeregg2001.komorebi.BuildConfig
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import java.io.IOException
++
++/** Configured at build time through BuildConfig.UPDATE_* (Gradle properties komorebiUpdate*). */
++object GithubReleaseUpdater {
++
++    sealed class Result {
++        object Disabled : Result()
++        object UpToDate : Result()
++        data class Available(val offer: UpdateOffer) : Result()
++        data class Failed(val message: String) : Result()
++    }
++
++    private const val TAG = "GithubReleaseUpdater"
++    private const val API = "https://api.github.com"
++
++    val isConfigured: Boolean
++        get() = BuildConfig.UPDATE_REPO.isNotBlank() && BuildConfig.UPDATE_CHANNEL.isNotBlank()
++
++    /** Blocking; call on an IO dispatcher. Never throws. */
++    fun check(client: OkHttpClient, receiveBetaUpdates: Boolean): Result {
++        val repo = BuildConfig.UPDATE_REPO.trim()
++        val channel = BuildConfig.UPDATE_CHANNEL.trim()
++        if (repo.isEmpty() || channel.isEmpty()) return Result.Disabled
++        val abis = Build.SUPPORTED_ABIS?.toList() ?: emptyList()
++        return try {
++            when (channel) {
++                "main" -> {
++                    val json = get(client, "$API/repos/$repo/releases/tags/$MAIN_TAG")
++                        ?: return Result.UpToDate
++                    val release = parseRelease(json) ?: return Result.UpToDate
++                    selectMainUpdate(release, BuildConfig.UPDATE_BUILD_NUMBER.toLong(), abis)
++                }
++                "stable", "beta" -> {
++                    val json = get(client, "$API/repos/$repo/releases?per_page=30")
++                        ?: throw HttpFailure(404)
++                    selectTaggedUpdate(parseReleaseList(json), BuildConfig.UPDATE_TAG, receiveBetaUpdates, abis)
++                }
++                else -> return Result.Disabled
++            }?.let { Result.Available(it) } ?: Result.UpToDate
++        } catch (e: RateLimited) {
++            Result.Failed("アップデート確認の回数制限に達しました。しばらくしてから再度お試しください")
++        } catch (e: HttpFailure) {
++            Result.Failed("アップデート情報の取得に失敗しました (HTTP ${e.code})")
++        } catch (e: IOException) {
++            Log.w(TAG, "Update check failed", e)
++            Result.Failed("ネットワークエラーが発生しました")
++        } catch (e: Exception) {
++            Log.e(TAG, "Update check failed", e)
++            Result.Failed("アップデート情報の解析に失敗しました")
++        }
++    }
++
++    private class RateLimited : Exception()
++    private class HttpFailure(val code: Int) : Exception()
++
++    /** Body of a successful GET; null on 404; throws on other failures. */
++    private fun get(client: OkHttpClient, url: String): String? {
++        val request = Request.Builder()
++            .url(url)
++            .header("Accept", "application/vnd.github+json")
++            .header("X-GitHub-Api-Version", "2022-11-28")
++            .header("User-Agent", "Komorebi/${BuildConfig.VERSION_NAME} (Android)")
++            .build()
++        client.newCall(request).execute().use { response ->
++            when {
++                response.isSuccessful -> return response.body?.string() ?: throw IOException("empty body")
++                response.code == 404 -> return null
++                response.code == 403 || response.code == 429 -> throw RateLimited()
++                else -> throw HttpFailure(response.code)
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/update/ReleaseSelection.kt b/app/src/main/java/kr/dcmys/komorebi/update/ReleaseSelection.kt
+new file mode 100644
+index 0000000..73e2096
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/update/ReleaseSelection.kt
+@@ -0,0 +1,169 @@
++package kr.dcmys.komorebi.update
++
++import com.google.gson.JsonArray
++import com.google.gson.JsonElement
++import com.google.gson.JsonObject
++import com.google.gson.Gson
++
++/*
++ * Release contract (shared with the CI workflow):
++ *  - stable: tag v<X.Y.Z>-<n>,        prerelease=false
++ *  - beta:   tag v<X.Y.Z-beta<k>>-<n>, prerelease=true
++ *  - main:   one rolling prerelease on the fixed tag "nightly"
++ *  - assets: komorebi-<label>-<abi>.apk, label = tag (stable/beta) or main-<n> (main),
++ *            abi in {arm64-v8a, armeabi-v7a, universal}; n = CI run number.
++ */
++
++const val MAIN_TAG = "nightly"
++const val UNIVERSAL_ABI = "universal"
++val SPLIT_ABIS = listOf("arm64-v8a", "armeabi-v7a")
++
++data class GithubAsset(val name: String, val downloadUrl: String)
++
++data class GithubRelease(
++    val tagName: String,
++    val draft: Boolean,
++    val prerelease: Boolean,
++    val body: String,
++    val assets: List<GithubAsset>,
++)
++
++data class UpdateOffer(val versionName: String, val releaseNotes: String, val apkUrl: String)
++
++/** Ordering: X.Y.Z numerically, a beta below the same X.Y.Z without suffix (betas by k), then n. */
++data class ReleaseTag(
++    val major: Int,
++    val minor: Int,
++    val patch: Int,
++    val beta: Int?,
++    val build: Long,
++) : Comparable<ReleaseTag> {
++    override fun compareTo(other: ReleaseTag): Int = COMPARATOR.compare(this, other)
++
++    companion object {
++        private val COMPARATOR = compareBy<ReleaseTag>(
++            { it.major }, { it.minor }, { it.patch },
++            { if (it.beta == null) 1 else 0 }, { it.beta ?: 0 }, { it.build },
++        )
++        private val TAG_RE = Regex("""^v(\d{1,6})\.(\d{1,6})\.(\d{1,6})(?:-beta(\d{1,6}))?-(\d{1,12})$""")
++
++        /** Returns null for anything that is not exactly a stable/beta CI tag (incl. "nightly"). */
++        fun parse(tag: String?): ReleaseTag? {
++            val m = TAG_RE.matchEntire(tag?.trim() ?: return null) ?: return null
++            val g = m.groupValues
++            return ReleaseTag(
++                g[1].toInt(), g[2].toInt(), g[3].toInt(),
++                g[4].takeIf { it.isNotEmpty() }?.toInt(), g[5].toLong(),
++            )
++        }
++    }
++}
++
++/** First asset `komorebi-<label>-<abi>.apk` matching [supportedAbis] in order, else universal. */
++fun chooseApk(assets: List<GithubAsset>, label: String, supportedAbis: List<String>): GithubAsset? {
++    fun find(abi: String) = assets.firstOrNull { it.name == "komorebi-$label-$abi.apk" }
++    for (abi in supportedAbis) {
++        if (abi in SPLIT_ABIS) find(abi)?.let { return it }
++    }
++    return find(UNIVERSAL_ABI)
++}
++
++/**
++ * stable/beta channel: the greatest non-draft CI-tagged release (prereleases only when
++ * [includePrerelease]) that has an APK for this device and is strictly newer than [installedTag].
++ * An unparsable [installedTag] (misconfigured build) never offers anything.
++ */
++fun selectTaggedUpdate(
++    releases: List<GithubRelease>,
++    installedTag: String,
++    includePrerelease: Boolean,
++    supportedAbis: List<String>,
++): UpdateOffer? {
++    val installed = ReleaseTag.parse(installedTag) ?: return null
++    return releases.asSequence()
++        .filter { !it.draft && (includePrerelease || !it.prerelease) }
++        .mapNotNull { r -> ReleaseTag.parse(r.tagName)?.let { it to r } }
++        .filter { (tag, _) -> tag > installed }
++        .sortedByDescending { (tag, _) -> tag }
++        .firstNotNullOfOrNull { (_, r) ->
++            val tagName = r.tagName.trim()
++            chooseApk(r.assets, tagName, supportedAbis)?.let {
++                UpdateOffer(tagName.removePrefix("v"), formatReleaseNotes(r.body), it.downloadUrl)
++            }
++        }
++}
++
++private val MAIN_ASSET_RE = Regex("""^komorebi-main-(\d{1,12})-(arm64-v8a|armeabi-v7a|universal)\.apk$""")
++
++/**
++ * main channel: the rolling "nightly" release; the newest build number n among its assets that has an
++ * APK for this device, offered when n > [installedBuild]. No (usable) assets -> null.
++ */
++fun selectMainUpdate(release: GithubRelease, installedBuild: Long, supportedAbis: List<String>): UpdateOffer? {
++    if (release.draft || release.tagName.trim() != MAIN_TAG) return null
++    val builds = release.assets
++        .mapNotNull { MAIN_ASSET_RE.matchEntire(it.name)?.groupValues?.get(1)?.toLongOrNull() }
++        .distinct()
++        .sortedDescending()
++    for (n in builds) {
++        if (n <= installedBuild) break
++        val apk = chooseApk(release.assets, "main-$n", supportedAbis) ?: continue
++        return UpdateOffer("main-$n", formatReleaseNotes(release.body), apk.downloadUrl)
++    }
++    return null
++}
++
++const val MAX_NOTES_CHARS = 600
++
++/** The update dialog shows plain text in a small fixed-height box: strip the noisiest Markdown and truncate. */
++fun formatReleaseNotes(body: String?, maxChars: Int = MAX_NOTES_CHARS): String {
++    val text = (body ?: "")
++        .replace("\r\n", "\n")
++        .replace(Regex("""<!--.*?-->""", RegexOption.DOT_MATCHES_ALL), "")
++        .lines()
++        .joinToString("\n") { line ->
++            line.trimEnd()
++                .replace(Regex("""^\s{0,3}#{1,6}\s+"""), "")
++                .replace(Regex("""^(\s*)[*+]\s+"""), "$1・")
++                .replace(Regex("""^(\s*)-\s+"""), "$1・")
++                .replace(Regex("""\[([^\]]*)]\((https?://[^)]*)\)"""), "$1")
++                .replace("**", "")
++                .replace("`", "")
++        }
++        .replace(Regex("""\n{3,}"""), "\n\n")
++        .trim()
++    if (text.isEmpty()) return "リリースノートはありません。"
++    if (text.length <= maxChars) return text
++    return text.take(maxChars).trimEnd() + "…"
++}
++
++// Gson.fromJson works on every Gson version on the classpath (JsonParser.parseString needs 2.8.6+).
++private fun parseJson(json: String): JsonElement =
++    Gson().fromJson(json, JsonElement::class.java) ?: throw IllegalArgumentException("empty JSON")
++
++private fun JsonObject.str(name: String): String? =
++    get(name)?.takeIf { it.isJsonPrimitive }?.asString
++
++private fun JsonObject.bool(name: String): Boolean =
++    get(name)?.takeIf { it.isJsonPrimitive }?.let { runCatching { it.asBoolean }.getOrNull() } ?: false
++
++private fun releaseFrom(e: JsonElement): GithubRelease? {
++    if (!e.isJsonObject) return null
++    val o = e.asJsonObject
++    val tag = o.str("tag_name") ?: return null
++    val assets = (o.get("assets") as? JsonArray)?.mapNotNull { a ->
++        if (!a.isJsonObject) return@mapNotNull null
++        val ao = a.asJsonObject
++        val name = ao.str("name") ?: return@mapNotNull null
++        val url = ao.str("browser_download_url") ?: return@mapNotNull null
++        GithubAsset(name, url)
++    } ?: emptyList()
++    return GithubRelease(tag, o.bool("draft"), o.bool("prerelease"), o.str("body") ?: "", assets)
++}
++
++/** GET /repos/{repo}/releases body; throws on non-JSON / non-array. */
++fun parseReleaseList(json: String): List<GithubRelease> =
++    parseJson(json).asJsonArray.mapNotNull(::releaseFrom)
++
++/** GET /repos/{repo}/releases/tags/{tag} body; throws on non-JSON, null if not a release object. */
++fun parseRelease(json: String): GithubRelease? = releaseFrom(parseJson(json))
+diff --git a/app/src/test/java/kr/dcmys/komorebi/update/ReleaseSelectionTest.kt b/app/src/test/java/kr/dcmys/komorebi/update/ReleaseSelectionTest.kt
+new file mode 100644
+index 0000000..34006b4
+--- /dev/null
++++ b/app/src/test/java/kr/dcmys/komorebi/update/ReleaseSelectionTest.kt
+@@ -0,0 +1,200 @@
++package kr.dcmys.komorebi.update
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ReleaseSelectionTest {
++
++    private val arm64 = listOf("arm64-v8a", "armeabi-v7a", "armeabi")
++    private val arm32 = listOf("armeabi-v7a", "armeabi")
++    private val x86 = listOf("x86_64", "x86")
++
++    private fun assets(label: String, vararg abis: String = arrayOf("arm64-v8a", "armeabi-v7a", "universal")) =
++        abis.map { GithubAsset("komorebi-$label-$it.apk", "https://dl/$label/$it") }
++
++    private fun rel(tag: String, pre: Boolean = false, draft: Boolean = false, body: String = "notes $tag",
++                    assets: List<GithubAsset> = assets(tag)) =
++        GithubRelease(tag, draft, pre, body, assets)
++
++    @Test
++    fun orderingTable() {
++        val ordered = listOf(
++            "v0.9.0-beta2-1", "v1.1.0-beta7-2", "v1.1.0-1", "v1.1.1-3", "v1.1.1-4",
++            "v1.2.0-beta1-5", "v1.2.0-beta2-6", "v1.2.0-7", "v1.10.0-8",
++        ).map { ReleaseTag.parse(it)!! }
++        for (i in ordered.indices) for (j in ordered.indices) {
++            assertEquals("${ordered[i]} vs ${ordered[j]}", i.compareTo(j).coerceIn(-1, 1),
++                ordered[i].compareTo(ordered[j]).coerceIn(-1, 1))
++        }
++        assertTrue(ReleaseTag.parse("v1.1.1-1")!! > ReleaseTag.parse("v1.1.0-999")!!)
++        assertTrue(ReleaseTag.parse("v1.2.0-beta10-1")!! > ReleaseTag.parse("v1.2.0-beta9-2")!!)
++    }
++
++    @Test
++    fun parsesFields() {
++        assertEquals(ReleaseTag(1, 2, 0, 1, 124), ReleaseTag.parse("v1.2.0-beta1-124"))
++        assertEquals(ReleaseTag(1, 1, 1, null, 123), ReleaseTag.parse("v1.1.1-123"))
++    }
++
++    @Test
++    fun malformedTagsRejected() {
++        listOf(
++            null, "", "main", "nightly", "1.1.1-123", "v1.1.1", "v1.1-5", "v1.1.1-beta-5", "v1.1.1-beta1",
++            "v1.1.1-rc1-5", "v1.1.1-5-extra", "V1.1.1-5", "v1.1.1--5", "va.b.c-1", "v1.1.1-Stable",
++            "v1.1.1-99999999999999999",
++        ).forEach { assertNull(it, ReleaseTag.parse(it)) }
++    }
++
++    private val list = listOf(
++        rel("nightly", pre = true, assets = assets("main-130")),
++        rel("v1.2.0-beta2-129", pre = true),
++        rel("v1.2.0-beta1-125", pre = true),
++        rel("v1.1.1-124"),
++        rel("v1.1.1-120"),
++        rel("v1.1.0-100"),
++        rel("v1.3.0-140", draft = true),
++        rel("garbage"),
++    )
++
++    @Test
++    fun stableOnlyWhenBetaOff() {
++        val offer = selectTaggedUpdate(list, "v1.1.0-100", includePrerelease = false, supportedAbis = arm64)!!
++        assertEquals("1.1.1-124", offer.versionName)
++        assertEquals("https://dl/v1.1.1-124/arm64-v8a", offer.apkUrl)
++        assertEquals("notes v1.1.1-124", offer.releaseNotes)
++    }
++
++    @Test
++    fun betaIncludedWhenOn() {
++        val offer = selectTaggedUpdate(list, "v1.1.0-100", includePrerelease = true, supportedAbis = arm64)!!
++        assertEquals("1.2.0-beta2-129", offer.versionName)
++    }
++
++    @Test
++    fun draftsIgnored() {
++        val offer = selectTaggedUpdate(list, "v1.2.0-beta2-129", includePrerelease = true, supportedAbis = arm64)
++        assertNull(offer)
++    }
++
++    @Test
++    fun sameVersionNewerBuildIsUpdate() {
++        val offer = selectTaggedUpdate(list, "v1.1.1-120", includePrerelease = false, supportedAbis = arm64)!!
++        assertEquals("1.1.1-124", offer.versionName)
++    }
++
++    @Test
++    fun notOfferedWhenInstalledIsNewestOrNewer() {
++        assertNull(selectTaggedUpdate(list, "v1.1.1-124", false, arm64))
++        // installed beta, beta setting off: stable 1.1.1 is older than 1.2.0-beta1 -> nothing
++        assertNull(selectTaggedUpdate(list, "v1.2.0-beta1-125", false, arm64))
++    }
++
++    @Test
++    fun betaInstalledGetsFinalStable() {
++        val l = list + rel("v1.2.0-131")
++        assertEquals("1.2.0-131", selectTaggedUpdate(l, "v1.2.0-beta2-129", false, arm64)!!.versionName)
++    }
++
++    @Test
++    fun unparsableInstalledTagOffersNothing() {
++        assertNull(selectTaggedUpdate(list, "", true, arm64))
++        assertNull(selectTaggedUpdate(list, "main", true, arm64))
++    }
++
++    @Test
++    fun releaseWithoutUsableAssetFallsBackToNextBest() {
++        val l = listOf(
++            rel("v1.1.2-130", assets = emptyList()), // assets still uploading
++            rel("v1.1.1-124"),
++        )
++        assertEquals("1.1.1-124", selectTaggedUpdate(l, "v1.1.0-1", false, arm64)!!.versionName)
++        assertNull(selectTaggedUpdate(l.take(1), "v1.1.0-1", false, arm64))
++    }
++
++    @Test
++    fun mainOffersNewerBuild() {
++        val r = rel("nightly", pre = true, body = "rolling", assets = assets("main-125"))
++        val offer = selectMainUpdate(r, 120, arm32)!!
++        assertEquals("main-125", offer.versionName)
++        assertEquals("https://dl/main-125/armeabi-v7a", offer.apkUrl)
++        assertEquals("rolling", offer.releaseNotes)
++        assertNull(selectMainUpdate(r, 125, arm32))
++        assertNull(selectMainUpdate(r, 200, arm32))
++    }
++
++    @Test
++    fun mainMissingAssetsIsNoUpdate() {
++        assertNull(selectMainUpdate(rel("nightly", pre = true, assets = emptyList()), 0, arm64))
++        val junk = listOf(GithubAsset("komorebi-main-x-arm64-v8a.apk", "u"), GithubAsset("SHA256SUMS", "u"))
++        assertNull(selectMainUpdate(rel("nightly", pre = true, assets = junk), 0, arm64))
++    }
++
++    @Test
++    fun mainMixedBuildsDuringReplacement() {
++        // old universal still there, new build only has arm64 uploaded so far
++        val a = assets("main-124", "universal") + assets("main-125", "arm64-v8a")
++        val r = rel("nightly", pre = true, assets = a)
++        assertEquals("main-125", selectMainUpdate(r, 100, arm64)!!.versionName)
++        // armv7 device can't use 125 yet -> falls back to 124 universal
++        val o = selectMainUpdate(r, 100, arm32)!!
++        assertEquals("main-124", o.versionName)
++        assertEquals("https://dl/main-124/universal", o.apkUrl)
++    }
++
++    @Test
++    fun mainIgnoresWrongTag() {
++        assertNull(selectMainUpdate(rel("v1.1.1-5", assets = assets("main-9")), 0, arm64))
++    }
++
++    @Test
++    fun abiFallback() {
++        val all = assets("v1.1.1-1")
++        assertEquals("komorebi-v1.1.1-1-arm64-v8a.apk", chooseApk(all, "v1.1.1-1", arm64)!!.name)
++        assertEquals("komorebi-v1.1.1-1-armeabi-v7a.apk", chooseApk(all, "v1.1.1-1", arm32)!!.name)
++        assertEquals("komorebi-v1.1.1-1-universal.apk", chooseApk(all, "v1.1.1-1", x86)!!.name)
++        val noArm64 = assets("v1.1.1-1", "armeabi-v7a", "universal")
++        assertEquals("komorebi-v1.1.1-1-armeabi-v7a.apk", chooseApk(noArm64, "v1.1.1-1", arm64)!!.name)
++        assertEquals("komorebi-v1.1.1-1-universal.apk", chooseApk(assets("v1.1.1-1", "universal"), "v1.1.1-1", arm64)!!.name)
++        assertNull(chooseApk(assets("v1.1.1-1", "arm64-v8a"), "v1.1.1-1", arm32))
++        assertNull(chooseApk(all, "v1.1.1-2", arm64))
++    }
++
++    @Test
++    fun parsesGithubJson() {
++        val json = """
++            [{"tag_name":"v1.1.1-123","draft":false,"prerelease":false,"body":null,
++              "assets":[{"name":"komorebi-v1.1.1-123-universal.apk","browser_download_url":"https://x/u.apk","size":1}]},
++             {"tag_name":"nightly","draft":false,"prerelease":true,"body":"b","assets":[]},
++             {"no_tag":true}, 5]
++        """.trimIndent()
++        val l = parseReleaseList(json)
++        assertEquals(2, l.size)
++        assertEquals(GithubRelease("v1.1.1-123", false, false, "",
++            listOf(GithubAsset("komorebi-v1.1.1-123-universal.apk", "https://x/u.apk"))), l[0])
++        assertTrue(l[1].prerelease)
++        val one = parseRelease("""{"tag_name":"nightly","prerelease":true,"body":"x","assets":[{"name":"n"}]}""")!!
++        assertEquals(0, one.assets.size)
++        assertNull(parseRelease("""{"message":"Not Found"}"""))
++    }
++
++    @Test(expected = Exception::class)
++    fun listJsonMustBeArray() {
++        parseReleaseList("""{"message":"API rate limit exceeded"}""")
++    }
++
++    @Test
++    fun notesFormattedAndTruncated() {
++        assertEquals("リリースノートはありません。", formatReleaseNotes(null))
++        assertEquals("リリースノートはありません。", formatReleaseNotes("  \r\n "))
++        val md = "## What's Changed\r\n* **fix** `x` by @a in [#1](https://github.com/a/b/pull/1)\r\n<!-- c -->"
++        assertEquals("What's Changed\n・fix x by @a in #1", formatReleaseNotes(md))
++        val long = formatReleaseNotes("a".repeat(5000))
++        assertEquals(MAX_NOTES_CHARS + 1, long.length)
++        assertTrue(long.endsWith("…"))
++        assertNotNull(formatReleaseNotes("- item"))
++        assertEquals("・item", formatReleaseNotes("- item"))
++    }
++}

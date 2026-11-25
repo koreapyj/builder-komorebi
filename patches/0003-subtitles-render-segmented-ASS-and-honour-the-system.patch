@@ -1,0 +1,2808 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yoonji Park <koreapyj@dcmys.kr>
+Date: Wed, 25 Nov 2026 04:58:09 +0900
+Subject: [PATCH] subtitles: render segmented ASS and honour the system caption
+ style
+
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+
+diff --git a/app/src/main/cpp/native-lib.cpp b/app/src/main/cpp/native-lib.cpp
+index bfbb975..263c2a8 100644
+--- a/app/src/main/cpp/native-lib.cpp
++++ b/app/src/main/cpp/native-lib.cpp
+@@ -578,6 +578,32 @@ Java_com_beeregg2001_komorebi_NativeLib_decodeCaption(JNIEnv *env, jobject thiz,
+     return cue;
+ }
+ 
++// System caption style: draw no caption background (the forced stroke is kept), then
++// re-render the caption current at ptsMs so it can replace the one already on screen.
++JNIEXPORT jobject JNICALL
++Java_com_beeregg2001_komorebi_NativeLib_setCaptionNoBackground(JNIEnv *env, jobject thiz, jlong handle, jboolean noBackground, jlong ptsMs) {
++    auto* ctx = reinterpret_cast<AribCaptionDecoderContext*>(handle);
++    if (!ctx || !ctx->renderer) return nullptr;
++
++    aribcc_render_result_t renderResult = {};
++    aribcc_render_status_t renderStatus = ARIBCC_RENDER_STATUS_ERROR;
++    {
++        std::lock_guard<std::mutex> lock(ctx->mutex);
++        aribcc_renderer_set_force_no_background(ctx->renderer, noBackground == JNI_TRUE);
++        if (ptsMs >= 0) {
++            renderStatus = aribcc_renderer_render(ctx->renderer, static_cast<int64_t>(ptsMs), &renderResult);
++        }
++    }
++    if (renderStatus != ARIBCC_RENDER_STATUS_GOT_IMAGE &&
++        renderStatus != ARIBCC_RENDER_STATUS_GOT_IMAGE_UNCHANGED) {
++        aribcc_render_result_cleanup(&renderResult);
++        return nullptr;
++    }
++    jobject cue = renderResultToCue(env, renderResult, ptsMs, false);
++    aribcc_render_result_cleanup(&renderResult);
++    return cue;
++}
++
+ JNIEXPORT jintArray JNICALL
+ Java_com_beeregg2001_komorebi_NativeLib_getCaptionLanguageCodes(JNIEnv *env, jobject thiz, jlong handle) {
+     auto* ctx = reinterpret_cast<AribCaptionDecoderContext*>(handle);
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/NativeLib.kt b/app/src/main/java/com/beeregg2001/komorebi/NativeLib.kt
+index 5781381..9d8e76a 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/NativeLib.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/NativeLib.kt
+@@ -37,5 +37,7 @@ class NativeLib {
+     external fun getCaptionLanguageCodes(handle: Long): IntArray
+     external fun switchCaptionLanguage(handle: Long, languageId: Int)
+     external fun flushCaptionDecoder(handle: Long)
++    // System caption style: no background; returns the caption at ptsMs re-rendered (ptsMs < 0: none)
++    external fun setCaptionNoBackground(handle: Long, noBackground: Boolean, ptsMs: Long): NativeCaptionCue?
+     external fun closeCaptionDecoder(handle: Long)
+ }
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/live/LiveDualPlayer.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/live/LiveDualPlayer.kt
+index 2a3ce12..319e6cf 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/live/LiveDualPlayer.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/live/LiveDualPlayer.kt
+@@ -49,6 +49,7 @@ import com.beeregg2001.komorebi.ui.subtitle.NativeCaptionCue
+ import com.beeregg2001.komorebi.ui.subtitle.NativeCaptionOverlay
+ import com.beeregg2001.komorebi.ui.theme.KomorebiTheme
+ import kotlinx.coroutines.delay
++import kr.dcmys.komorebi.ass.IptvAssOverlay
+ 
+ /**
+  * 映像の表示アスペクト比（横 / 縦）を求める。
+@@ -252,6 +253,12 @@ fun DualDisplayPlayer(
+                         .aspectRatio(mainAspectRatio)
+                 )
+             }
++            if (state.currentStreamSource == StreamSource.IPTV) IptvAssOverlay(
++                player = mainPlayer,
++                enabled = isSubtitleEnabled,
++                visible = isSubtitleEnabled && !isUiVisible,
++                modifier = Modifier.align(Alignment.Center).aspectRatio(mainAspectRatio)
++            )
+ 
+             androidx.compose.animation.AnimatedVisibility(
+                 visible = showInfo,
+@@ -375,6 +382,12 @@ fun DualDisplayPlayer(
+                             .aspectRatio(dualAspectRatio)
+                     )
+                 }
++                if (state.currentStreamSource == StreamSource.IPTV) IptvAssOverlay(
++                    player = dualPlayer,
++                    enabled = isSubtitleEnabled,
++                    visible = isSubtitleEnabled && !isUiVisible,
++                    modifier = Modifier.align(Alignment.Center).aspectRatio(dualAspectRatio)
++                )
+ 
+                 androidx.compose.animation.AnimatedVisibility(
+                     visible = showInfo,
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/live/LivePlayerScreen.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/live/LivePlayerScreen.kt
+index 6f23761..eadc4a3 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/live/LivePlayerScreen.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/live/LivePlayerScreen.kt
+@@ -48,6 +48,8 @@ import com.beeregg2001.komorebi.data.model.StreamSource
+ import com.beeregg2001.komorebi.ui.subtitle.NativeCaptionOverlay
+ import com.beeregg2001.komorebi.ui.subtitle.rememberNativeCaptionCue
+ import com.beeregg2001.komorebi.ui.theme.KomorebiTheme
++import kr.dcmys.komorebi.ass.IptvAssOverlay
++import kr.dcmys.komorebi.ass.liveVideoRect
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
+ import org.json.JSONObject
+@@ -711,6 +713,12 @@ fun LivePlayerScreen(
+                         visible = isSubtitleEnabled && !isUiVisible,
+                         modifier = Modifier.fillMaxSize()
+                     )
++                    if (ps.currentStreamSource == StreamSource.IPTV) IptvAssOverlay(
++                        player = mainPlayer,
++                        enabled = isSubtitleEnabled,
++                        visible = isSubtitleEnabled && !isUiVisible,
++                        modifier = Modifier.liveVideoRect(ps, videoWidth, videoHeight, pixelWidthHeightRatio)
++                    )
+                 }
+ 
+                 if (isHeavyUiReady && isCommentEnabled) {
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/subtitle/NativeCaptionDecoder.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/subtitle/NativeCaptionDecoder.kt
+index f2eff8e..d6c9718 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/subtitle/NativeCaptionDecoder.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/subtitle/NativeCaptionDecoder.kt
+@@ -2,6 +2,7 @@ package com.beeregg2001.komorebi.ui.subtitle
+ 
+ import android.util.Log
+ import com.beeregg2001.komorebi.NativeLib
++import kr.dcmys.komorebi.platform.AribCaptionSystemStyle
+ 
+ class NativeCaptionDecoder(
+     private val nativeLib: NativeLib = NativeLib()
+@@ -10,6 +11,7 @@ class NativeCaptionDecoder(
+     private var languages: List<NativeCaptionLanguage> = emptyList()
+     private var lastPtsMs: Long? = null
+     private var lastManagementData: ByteArray? = null
++    private var appliedNoBackground = false
+ 
+     @Synchronized
+     fun decode(
+@@ -24,7 +26,12 @@ class NativeCaptionDecoder(
+                 nativeLib.flushCaptionDecoder(activeHandle)
+             }
+             lastPtsMs = ptsMs
+-            val cue = nativeLib.decodeCaption(activeHandle, data, ptsMs)
++            var cue = nativeLib.decodeCaption(activeHandle, data, ptsMs)
++            val noBackground = AribCaptionSystemStyle.noBackground
++            if (noBackground != appliedNoBackground) {
++                appliedNoBackground = noBackground
++                nativeLib.setCaptionNoBackground(activeHandle, noBackground, ptsMs)?.let { cue = it }
++            }
+             // 管理データが言語表を更新したときだけ JNI 問い合わせを行う。
+             val managementChanged = AribCaptionData.isManagementPacket(data) &&
+                 lastManagementData?.contentEquals(data) != true
+@@ -70,6 +77,7 @@ class NativeCaptionDecoder(
+         val activeHandle = handle
+         if (activeHandle != 0L) nativeLib.closeCaptionDecoder(activeHandle)
+         handle = nativeLib.openCaptionDecoder()
++        appliedNoBackground = false
+         languages = emptyList()
+         lastPtsMs = null
+         lastManagementData = null
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/subtitle/NativeCaptionOverlay.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/subtitle/NativeCaptionOverlay.kt
+index dc4303a..a29ac20 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/subtitle/NativeCaptionOverlay.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/subtitle/NativeCaptionOverlay.kt
+@@ -4,6 +4,7 @@ import androidx.compose.foundation.Canvas
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.MutableState
++import androidx.compose.runtime.SideEffect
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberUpdatedState
+@@ -13,6 +14,8 @@ import androidx.compose.ui.unit.IntOffset
+ import androidx.compose.ui.unit.IntSize
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.Flow
++import kr.dcmys.komorebi.platform.AribCaptionSystemStyle
++import kr.dcmys.komorebi.platform.rememberSystemCaptionStyle
+ 
+ private const val TIMELINE_TICK_MS = 50L
+ 
+@@ -26,6 +29,8 @@ fun rememberNativeCaptionCue(
+     val cueState = remember { mutableStateOf<NativeCaptionCue?>(null) }
+     val timeline = remember { NativeCaptionTimeline() }
+     val currentPositionMs = rememberUpdatedState(positionMs)
++    val systemCaptionStyle = rememberSystemCaptionStyle()
++    SideEffect { AribCaptionSystemStyle.current = systemCaptionStyle }
+     LaunchedEffect(resetKey, enabled) {
+         timeline.reset()
+         cueState.value = null
+diff --git a/app/src/main/java/kr/dcmys/komorebi/ass/AssLibassRenderer.kt b/app/src/main/java/kr/dcmys/komorebi/ass/AssLibassRenderer.kt
+new file mode 100644
+index 0000000..33c8f82
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/ass/AssLibassRenderer.kt
+@@ -0,0 +1,258 @@
++package kr.dcmys.komorebi.ass
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.graphics.Canvas
++import android.os.Handler
++import android.os.HandlerThread
++import android.util.Log
++import androidx.compose.ui.graphics.ImageBitmap
++import androidx.compose.ui.graphics.asImageBitmap
++import io.github.peerless2012.ass.Ass
++import io.github.peerless2012.ass.AssRender
++import io.github.peerless2012.ass.AssTexType
++import io.github.peerless2012.ass.AssTrack
++import java.io.IOException
++
++internal class AssRenderedFrame(
++    val image: ImageBitmap,
++    val left: Int,
++    val top: Int,
++    val frameWidth: Int,
++    val frameHeight: Int,
++)
++
++/**
++ * Runs every libass call on one dedicated thread (including the slow fontconfig scan in
++ * `createRender`) so the UI thread never waits on the library lock.
++ *
++ * The track is rebuilt from the event snapshot on each change (ass-kt has no per-event update);
++ * libass drops a chunk whose ReadOrder it has already seen, so each rebuild uses fresh numbers.
++ */
++internal class AssLibassRenderer(
++    context: Context,
++    private val onFrame: (AssRenderedFrame?) -> Unit,
++) {
++    private val appContext = context.applicationContext
++    private val thread = HandlerThread("AssLibass").apply { start() }
++    private val handler = Handler(thread.looper)
++
++    // State below is only touched on [thread].
++    private var ass: Ass? = null
++    private var render: AssRender? = null
++    private var track: AssTrack? = null
++    private var trackHeader: String? = null
++    private var trackBorder: AssBorderMode? = null
++    private var border = AssBorderMode.AUTHORED
++
++    private var trackEvents: List<AssResolvedEvent> = emptyList()
++    private var fontFamily: String? = null
++    private var readOrder = 0
++    private var frameWidth = 0
++    private var frameHeight = 0
++    private var showing = false
++
++    @Volatile
++    private var pendingTimeMs = 0L
++    private val renderRunnable = Runnable { renderNow(pendingTimeMs) }
++
++    init {
++        handler.post { initLibass() }
++    }
++
++    private fun initLibass() {
++        try {
++            val library = Ass()
++            // Memory fonts must be added before the renderer is created (ass_set_fonts loads them).
++            fontFamily = if (addAribFont(library)) ARIB_FONT_FAMILY else null
++            ass = library
++            render = library.createRender()
++        } catch (t: Throwable) {
++            // Missing native library or libass failure: captions are simply not drawn.
++            Log.w(TAG, "libass unavailable", t)
++            ass = null
++            render = null
++        }
++    }
++
++    private fun addAribFont(library: Ass): Boolean = try {
++        val bytes = appContext.assets.open(ARIB_FONT_ASSET).use { it.readBytes() }
++        library.addFont(ARIB_FONT_ASSET.substringAfterLast('/'), bytes)
++        true
++    } catch (e: IOException) {
++        // The build copies the font into assets; without it libass falls back to system fonts.
++        Log.w(TAG, "ARIB font asset missing; using system fonts", e)
++        false
++    }
++
++    fun submit(header: String?, events: List<AssResolvedEvent>) {
++        handler.post { applyEvents(header, events) }
++    }
++
++    private fun applyEvents(header: String?, events: List<AssResolvedEvent>) {
++        val library = ass ?: return
++        val renderer = render ?: return
++        if (header == null) {
++            trackEvents = emptyList()
++            track?.clearEvent()
++            return
++        }
++        trackEvents = events
++        val old = track
++        val t: AssTrack
++        if (old == null || header !== trackHeader || border != trackBorder || readOrder > MAX_READ_ORDER) {
++            t = library.createTrack()
++            t.readBuffer(AssScript.prepareHeader(header, fontFamily, border).toByteArray(Charsets.UTF_8))
++            renderer.setTrack(t)
++            old?.release()
++            track = t
++            trackHeader = header
++            trackBorder = border
++            readOrder = 0
++        } else {
++            t = old
++            t.clearEvent()
++        }
++        for (ev in events) {
++            val d = ev.dialogue
++            if (AssScript.cleanText(d.text).isEmpty()) continue // a "clear" row draws nothing
++            val chunk = AssScript.chunkLine(++readOrder, d).toByteArray(Charsets.UTF_8)
++            t.readChunk(ev.startMs, ev.endMs - ev.startMs, chunk)
++        }
++    }
++
++    /** Runs after any render already queued, so a late picture of the old content is never published after the null this emits. */
++    fun clear() {
++        handler.post {
++            trackEvents = emptyList()
++            resetChangeDetection()
++            track?.clearEvent()
++            showing = false
++            onFrame(null)
++        }
++    }
++
++    /**
++     * Makes libass forget its previous picture so identical captions fed again (A -> B -> A zap) are
++     * reported as changed. libass only updates that list when the track has events (ass_start_frame
++     * bails out on an empty one), hence one render with an inactive placeholder event.
++     */
++    private fun resetChangeDetection() {
++        val t = track ?: return
++        val renderer = render ?: return
++        if (frameWidth <= 0 || frameHeight <= 0) return
++        try {
++            t.clearEvent()
++            t.readChunk(0L, 1L, "${++readOrder},0,Default,,0,0,0,,".toByteArray(Charsets.UTF_8))
++            renderer.renderFrame(2L, AssTexType.BITMAP_RGBA)
++        } catch (e: Throwable) {
++            Log.w(TAG, "libass change-detection reset failed", e)
++        }
++    }
++
++    fun setBorderMode(mode: AssBorderMode) {
++        handler.post {
++            if (mode == border) return@post
++            border = mode
++            val header = trackHeader
++            if (track != null && header != null) applyEvents(header, trackEvents)
++        }
++    }
++
++    fun setFrameSize(width: Int, height: Int) {
++        handler.post {
++            frameWidth = width
++            frameHeight = height
++            render?.setFrameSize(width, height)
++            render?.setStorageSize(width, height)
++        }
++    }
++
++    /** Render at libass time [timeMs] (epoch ms); coalesces with a request not yet started. */
++    fun requestRender(timeMs: Long) {
++        pendingTimeMs = timeMs
++        handler.removeCallbacks(renderRunnable)
++        handler.post(renderRunnable)
++    }
++
++    private fun renderNow(timeMs: Long) {
++        val renderer = render ?: return
++        if (track == null || frameWidth <= 0 || frameHeight <= 0) return
++        val frame = try {
++            renderer.renderFrame(timeMs, AssTexType.BITMAP_RGBA)
++        } catch (t: Throwable) {
++            Log.w(TAG, "renderFrame failed", t)
++            null
++        }
++        // ass-kt returns null when libass produced no image at all, and a frame with
++        // changed == 0 (no images) when the picture is identical to the previous call.
++        if (frame != null && frame.changed == 0) return
++        val images = frame?.images
++
++        if (images.isNullOrEmpty()) {
++            if (showing) {
++                showing = false
++                onFrame(null)
++            }
++            return
++        }
++        var left = Int.MAX_VALUE
++        var top = Int.MAX_VALUE
++        var right = Int.MIN_VALUE
++        var bottom = Int.MIN_VALUE
++        for (tex in images) {
++            if (tex.bitmap == null || tex.w <= 0 || tex.h <= 0) continue
++            left = minOf(left, tex.x)
++            top = minOf(top, tex.y)
++            right = maxOf(right, tex.x + tex.w)
++            bottom = maxOf(bottom, tex.y + tex.h)
++        }
++        if (right <= left || bottom <= top) {
++            if (showing) {
++                showing = false
++                onFrame(null)
++            }
++            return
++        }
++        // Allocated only when the picture changes; the previous one may still be on screen.
++        val picture = Bitmap.createBitmap(right - left, bottom - top, Bitmap.Config.ARGB_8888)
++        val canvas = Canvas(picture)
++        for (tex in images) {
++            val bitmap = tex.bitmap ?: continue
++            canvas.drawBitmap(bitmap, (tex.x - left).toFloat(), (tex.y - top).toFloat(), null)
++            bitmap.recycle()
++        }
++        showing = true
++        onFrame(AssRenderedFrame(picture.asImageBitmap(), left, top, frameWidth, frameHeight))
++    }
++
++    fun release() {
++        handler.removeCallbacks(renderRunnable)
++        handler.post {
++            try {
++                render?.release()
++                track?.release()
++                ass?.release()
++            } catch (t: Throwable) {
++                Log.w(TAG, "libass release failed", t)
++            }
++            render = null
++            track = null
++            ass = null
++            thread.quitSafely()
++        }
++    }
++
++    companion object {
++        private const val TAG = "AssLibassRenderer"
++
++        /** Placed by the build (downloaded; not in the source tree). */
++        const val ARIB_FONT_ASSET = "fonts/WLCMARU2004ARIBU.TTF"
++
++        /** Family name inside that TTF; also the Fontname init.ass styles use. */
++        const val ARIB_FONT_FAMILY = "WadaLabChuMaruGo2004ARIB"
++
++        /** Recreate the track before libass's ReadOrder bitmap grows large. */
++        private const val MAX_READ_ORDER = 200_000
++    }
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/ass/AssPlaylist.kt b/app/src/main/java/kr/dcmys/komorebi/ass/AssPlaylist.kt
+new file mode 100644
+index 0000000..aa414e5
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/ass/AssPlaylist.kt
+@@ -0,0 +1,127 @@
++package kr.dcmys.komorebi.ass
++
++import java.net.URI
++
++data class AssPlaylistSegment(
++    val uri: String,
++    val durationMs: Long,
++    /** Epoch ms of segment-local time 0 (EXT-X-PROGRAM-DATE-TIME, or extrapolated); null if none. */
++    val startMs: Long?,
++    val mapUri: String?,
++    val discontinuity: Boolean,
++)
++
++data class AssMediaPlaylist(
++    val targetDurationMs: Long,
++    val segments: List<AssPlaylistSegment>,
++    val endList: Boolean,
++) {
++    val isAss: Boolean
++        get() = segments.any { isAssPath(it.mapUri) || isAssPath(it.uri) }
++
++    private fun isAssPath(uri: String?): Boolean =
++        uri != null && uri.substringBefore('?').substringBefore('#').endsWith(".ass", ignoreCase = true)
++}
++
++object AssPlaylistParser {
++
++    private const val DEFAULT_TARGET_DURATION_MS = 5_000L
++    private val MAP_URI = Regex("""^#EXT-X-MAP:.*?URI="([^"]+)"""", RegexOption.IGNORE_CASE)
++    private val PDT = Regex(
++        """^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?\s*(Z|z|[+-]\d{2}(?::?\d{2})?)?$""",
++    )
++
++    fun parse(text: String, playlistUrl: String): AssMediaPlaylist {
++        var targetDurationMs = DEFAULT_TARGET_DURATION_MS
++        var currentMap: String? = null
++        var pendingDuration = 0L
++        var pendingPdt: Long? = null
++        var pendingDiscontinuity = false
++        var endList = false
++        val raw = ArrayList<AssPlaylistSegment>()
++
++        for (rawLine in text.removePrefix("\uFEFF").split('\n')) {
++            val line = rawLine.trim()
++            if (line.isEmpty()) continue
++            if (line.startsWith("#")) {
++                when {
++                    line.startsWith("#EXT-X-TARGETDURATION:", ignoreCase = true) ->
++                        line.substringAfter(':').trim().toDoubleOrNull()?.let {
++                            targetDurationMs = (it * 1000).toLong()
++                        }
++                    line.startsWith("#EXT-X-MAP:", ignoreCase = true) ->
++                        MAP_URI.find(line)?.let { currentMap = resolve(playlistUrl, it.groupValues[1]) }
++                    line.startsWith("#EXTINF:", ignoreCase = true) ->
++                        pendingDuration = ((line.substringAfter(':').substringBefore(',').trim()
++                            .toDoubleOrNull() ?: 0.0) * 1000).toLong()
++                    line.startsWith("#EXT-X-PROGRAM-DATE-TIME:", ignoreCase = true) ->
++                        pendingPdt = parseProgramDateTimeMs(line.substringAfter(':'))
++                    line.equals("#EXT-X-DISCONTINUITY", ignoreCase = true) ->
++                        pendingDiscontinuity = true
++                    line.equals("#EXT-X-ENDLIST", ignoreCase = true) -> endList = true
++                }
++                continue
++            }
++            raw += AssPlaylistSegment(
++                uri = resolve(playlistUrl, line),
++                durationMs = pendingDuration,
++                startMs = pendingPdt,
++                mapUri = currentMap,
++                discontinuity = pendingDiscontinuity,
++            )
++            pendingDuration = 0L
++            pendingPdt = null
++            pendingDiscontinuity = false
++        }
++        return AssMediaPlaylist(targetDurationMs, extrapolateStarts(raw), endList)
++    }
++
++    private fun extrapolateStarts(segments: List<AssPlaylistSegment>): List<AssPlaylistSegment> {
++        if (segments.none { it.startMs != null } || segments.all { it.startMs != null }) return segments
++        val starts = arrayOfNulls<Long>(segments.size)
++        for (i in segments.indices) {
++            starts[i] = segments[i].startMs
++                ?: if (i > 0) starts[i - 1]?.let { it + segments[i - 1].durationMs } else null
++        }
++        for (i in segments.indices.reversed()) {
++            if (starts[i] == null && i + 1 < segments.size) {
++                starts[i] = starts[i + 1]?.let { it - segments[i].durationMs }
++            }
++        }
++        return segments.mapIndexed { i, s -> if (s.startMs == starts[i]) s else s.copy(startMs = starts[i]) }
++    }
++
++    /** ISO-8601 date-time (offset `Z`, `+hh:mm`, `+hhmm`, `+hh`, or none = UTC) to epoch ms. */
++    fun parseProgramDateTimeMs(value: String): Long? {
++        val m = PDT.matchEntire(value.trim()) ?: return null
++        val g = m.groupValues
++        val days = daysFromCivil(g[1].toLong(), g[2].toInt(), g[3].toInt())
++        val millis = g[7].padEnd(3, '0').substring(0, 3).toLong()
++        var ms = ((days * 24 + g[4].toLong()) * 60 + g[5].toLong()) * 60_000L + g[6].toLong() * 1000 + millis
++        val offset = g[8]
++        if (offset.isNotEmpty() && offset != "Z" && offset != "z") {
++            val sign = if (offset[0] == '-') -1 else 1
++            val digits = offset.substring(1).replace(":", "")
++            val hours = digits.substring(0, 2).toLong()
++            val minutes = if (digits.length >= 4) digits.substring(2, 4).toLong() else 0L
++            ms -= sign * (hours * 60 + minutes) * 60_000L
++        }
++        return ms
++    }
++
++    private fun daysFromCivil(year: Long, month: Int, day: Int): Long {
++        val y = if (month <= 2) year - 1 else year
++        val era = (if (y >= 0) y else y - 399) / 400
++        val yoe = y - era * 400
++        val mp = (month + 9) % 12
++        val doy = (153 * mp + 2) / 5 + day - 1
++        val doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
++        return era * 146_097 + doe - 719_468
++    }
++
++    fun resolve(base: String, reference: String): String = try {
++        URI(base).resolve(reference.trim()).toString()
++    } catch (e: Exception) {
++        reference.trim()
++    }
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/ass/AssScript.kt b/app/src/main/java/kr/dcmys/komorebi/ass/AssScript.kt
+new file mode 100644
+index 0000000..095641f
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/ass/AssScript.kt
+@@ -0,0 +1,139 @@
++package kr.dcmys.komorebi.ass
++
++import kr.dcmys.komorebi.platform.SystemCaptionStyle
++
++object AssScript {
++
++    /** The `[Events]` format the libass track is given; Matroska-style chunks skip its first 3. */
++    const val EVENTS_FORMAT = "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
++
++    /**
++     * Per-event overrides stripped before rendering: the producer's transparent outline
++     * (`\3a&Hff&`) and fixed `\bord3` would otherwise override the style's own border.
++     */
++    private val STRIPPED_OVERRIDES = Regex("""\{\\(3a&Hff&|bord3)\}""")
++
++    fun cleanText(text: String): String = STRIPPED_OVERRIDES.replace(text, "")
++
++    /**
++     * Prepares init.ass for libass: outline/back alpha forced opaque, every style's Fontname set to
++     * [fontFamily] (the registered ARIB font, also the fallback face), borders rewritten for [border].
++     */
++    fun prepareHeader(
++        header: String,
++        fontFamily: String?,
++        border: AssBorderMode = AssBorderMode.AUTHORED,
++    ): String {
++        val out = StringBuilder(header.length + 128)
++        var section = ""
++        var styleFields: List<String>? = null
++        for (raw in header.removePrefix("\uFEFF").replace("\r\n", "\n").split('\n')) {
++            val line = raw.trim()
++            if (line.startsWith("[") && line.endsWith("]")) {
++                section = line.substring(1, line.length - 1).trim()
++                if (section.equals("Events", ignoreCase = true)) continue
++            }
++            if (section.equals("Events", ignoreCase = true)) continue
++            val isStyles = section.equals("V4+ Styles", ignoreCase = true) ||
++                section.equals("V4 Styles", ignoreCase = true)
++            if (isStyles && line.startsWith("Format:", ignoreCase = true)) {
++                styleFields = line.substringAfter(':').split(',').map { it.trim() }
++            } else if (isStyles && line.startsWith("Style:", ignoreCase = true) && styleFields != null) {
++                out.append(rewriteStyle(line, styleFields, fontFamily, border)).append('\n')
++                continue
++            }
++            out.append(raw.trimEnd()).append('\n')
++        }
++        while (out.endsWith("\n\n")) out.setLength(out.length - 1)
++        out.append('\n').append("[Events]\n").append(EVENTS_FORMAT).append('\n')
++        return out.toString()
++    }
++
++    private fun rewriteStyle(
++        line: String,
++        fields: List<String>,
++        fontFamily: String?,
++        border: AssBorderMode,
++    ): String {
++        val values = line.substringAfter(':').split(',').map { it.trim() }.toMutableList()
++        for (i in fields.indices) {
++            if (i >= values.size) break
++            when {
++                fields[i].equals("Fontname", ignoreCase = true) && fontFamily != null -> values[i] = fontFamily
++                fields[i].equals("OutlineColour", ignoreCase = true) ||
++                    fields[i].equals("BackColour", ignoreCase = true) -> values[i] = opaque(values[i])
++            }
++        }
++        applyBorder(values, fields, border)
++        return "Style: " + values.joinToString(",")
++    }
++
++    private fun applyBorder(values: MutableList<String>, fields: List<String>, border: AssBorderMode) {
++        if (border == AssBorderMode.AUTHORED) return
++        val borderStyle = fields.indexOfFirst { it.equals("BorderStyle", ignoreCase = true) }
++        val outline = fields.indexOfFirst { it.equals("Outline", ignoreCase = true) }
++        val shadow = fields.indexOfFirst { it.equals("Shadow", ignoreCase = true) }
++        if (borderStyle !in values.indices || outline !in values.indices || shadow !in values.indices) return
++        when (border) {
++            AssBorderMode.AUTHORED -> Unit
++            AssBorderMode.OUTLINE -> {
++                values[borderStyle] = "1"; values[outline] = "2"; values[shadow] = "0"
++            }
++            AssBorderMode.SHADOW -> {
++                values[borderStyle] = "1"; values[outline] = "0"; values[shadow] = "1"
++            }
++            AssBorderMode.BOX_OUTLINE -> when (values[borderStyle].toDoubleOrNull()?.toInt()) {
++                // libass BorderStyle 4: per-event box in BackColour padded by Shadow; glyph
++                // outlines are drawn normally, glyph shadows never. Keep the box, add the outline.
++                4 -> values[outline] = "2"
++                1 -> { values[outline] = "2"; values[shadow] = "0" }
++                // BorderStyle 3 draws its box from the outline itself: nothing to add.
++                else -> Unit
++            }
++        }
++    }
++
++    /**
++     * Only the presentational parts of the system caption style are honoured. Nothing customised,
++     * or background kept with a drop shadow, stays [AssBorderMode.AUTHORED]: a BorderStyle 4 box
++     * suppresses glyph shadows, and the shadow colour is the box colour.
++     */
++    fun borderModeFor(style: SystemCaptionStyle): AssBorderMode = when {
++        style.transparentBackground && style.edge == SystemCaptionStyle.Edge.DROP_SHADOW -> AssBorderMode.SHADOW
++        style.transparentBackground -> AssBorderMode.OUTLINE
++        style.edge == SystemCaptionStyle.Edge.OUTLINE -> AssBorderMode.BOX_OUTLINE
++        else -> AssBorderMode.AUTHORED
++    }
++
++    /** `&HAABBGGRR` (or decimal) with the alpha byte cleared; unparsable values are kept. */
++    fun opaque(colour: String): String {
++        val v = colour.trim()
++        val parsed = if (v.startsWith("&H", ignoreCase = true)) {
++            v.substring(2).trimEnd('&').toLongOrNull(16)
++        } else {
++            v.toLongOrNull()
++        } ?: return colour
++        return "&H%08X".format(parsed and 0x00FFFFFFL)
++    }
++
++    /** One Matroska-style chunk for `ass_process_chunk`: ReadOrder, Layer, then fields from Style. */
++    fun chunkLine(readOrder: Int, d: AssDialogue): String =
++        "$readOrder,${d.layer},${d.style},${d.name},${d.marginL},${d.marginR},${d.marginV},${d.effect},${cleanText(d.text)}"
++
++    /**
++     * Wall-clock (epoch ms) of the playback position; a positive [offsetMs] shows captions later.
++     * Callers check `windowStartTimeMs != C.TIME_UNSET` first. Primitive-only: used once per frame.
++     */
++    fun playbackWallClockMs(windowStartTimeMs: Long, positionMs: Long, offsetMs: Long): Long =
++        windowStartTimeMs + positionMs - offsetMs
++}
++
++enum class AssBorderMode {
++    AUTHORED,
++
++    OUTLINE,
++
++    SHADOW,
++
++    BOX_OUTLINE,
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/ass/AssSegmentIndex.kt b/app/src/main/java/kr/dcmys/komorebi/ass/AssSegmentIndex.kt
+new file mode 100644
+index 0000000..e015b34
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/ass/AssSegmentIndex.kt
+@@ -0,0 +1,190 @@
++package kr.dcmys.komorebi.ass
++
++data class AssSegmentLink(
++    val uri: String,
++    /** Epoch ms of the segment's local time 0. */
++    val startMs: Long,
++    val durationMs: Long,
++    val prev: String?,
++    val prevDurationMs: Long,
++    val boundary: Boolean,
++    val mapUri: String?,
++) {
++    val endMs: Long get() = startMs + durationMs
++}
++
++/** De-duplicated by URL, bounded by [limit]. Not thread-safe; owned by a single thread. */
++class AssSegmentIndex(private val limit: Int = DEFAULT_LIMIT) {
++
++    private val links = LinkedHashMap<String, AssSegmentLink>()
++    private val nextByUri = HashMap<String, String>()
++
++    var targetDurationMs: Long = 5_000L
++        private set
++
++    val size: Int get() = links.size
++
++    operator fun get(uri: String): AssSegmentLink? = links[uri]
++
++    fun clear() {
++        links.clear()
++        nextByUri.clear()
++    }
++
++    fun ingest(playlist: AssMediaPlaylist) {
++        if (playlist.targetDurationMs > 0) targetDurationMs = playlist.targetDurationMs
++        var prev: AssPlaylistSegment? = null
++        for (seg in playlist.segments) {
++            val start = seg.startMs
++            if (start == null) {
++                prev = null // cannot place it on the wall clock
++                continue
++            }
++            // The playlist's first segment has no known predecessor; keep one learned earlier.
++            if (prev != null || !links.containsKey(seg.uri)) {
++                links[seg.uri] = AssSegmentLink(
++                    uri = seg.uri,
++                    startMs = start,
++                    durationMs = seg.durationMs,
++                    prev = prev?.uri,
++                    prevDurationMs = prev?.durationMs ?: 0L,
++                    boundary = seg.discontinuity,
++                    mapUri = seg.mapUri,
++                )
++            }
++            if (prev != null) nextByUri[prev.uri] = seg.uri
++            prev = seg
++        }
++        val it = links.keys.iterator()
++        while (links.size > limit && it.hasNext()) {
++            nextByUri.remove(it.next())
++            it.remove()
++        }
++    }
++
++    fun nextOf(uri: String): AssSegmentLink? = nextByUri[uri]?.let { links[it] }
++
++    fun segmentAt(t: Long): AssSegmentLink? {
++        var best: AssSegmentLink? = null
++        for (link in links.values) {
++            if (link.startMs <= t && (best == null || link.startMs > best.startMs)) best = link
++        }
++        val found = best ?: return null
++        return if (t < found.startMs + maxOf(found.durationMs, targetDurationMs)) found else null
++    }
++
++    companion object {
++        const val DEFAULT_LIMIT = 2_000
++    }
++}
++
++sealed class AssFeedStep {
++    object Idle : AssFeedStep()
++
++    /** Playback left the fetched range and no segment covers it yet: drop the captions. */
++    object Drop : AssFeedStep()
++
++    /** Not continuing the last segment: drop captions, append [link], then backfill before it. */
++    data class Restart(val link: AssSegmentLink) : AssFeedStep()
++
++    data class Append(val link: AssSegmentLink) : AssFeedStep()
++}
++
++/**
++ * Fetches only segments near the playback position: the one holding it and up to
++ * [lookaheadSegments] target durations past it. A seek inside the fetched range keeps the captions;
++ * one outside it drops them and restarts (with backfill) at the new position.
++ */
++class AssFeedPlanner(
++    private val index: AssSegmentIndex,
++    private val lookaheadSegments: Int = 2,
++) {
++    private var rangeStartMs = 0L
++    var lastAppended: AssSegmentLink? = null
++        private set
++
++    fun reset() {
++        lastAppended = null
++    }
++
++    fun markAppended(link: AssSegmentLink) {
++        if (lastAppended == null) rangeStartMs = link.startMs
++        lastAppended = link
++    }
++
++    /** Captions before [cutoffMs] were pruned: a seek back there must restart. */
++    fun trimRangeStart(cutoffMs: Long) {
++        if (cutoffMs > rangeStartMs) rangeStartMs = cutoffMs
++    }
++
++    fun plan(nowMs: Long): AssFeedStep {
++        val last = lastAppended
++        if (last != null) {
++            if (nowMs >= rangeStartMs && nowMs < last.endMs + index.targetDurationMs) {
++                val next = index.nextOf(last.uri) ?: return AssFeedStep.Idle
++                val horizon = nowMs + lookaheadSegments * index.targetDurationMs
++                return if (next.startMs <= horizon) AssFeedStep.Append(next) else AssFeedStep.Idle
++            }
++            val current = index.segmentAt(nowMs)
++            reset()
++            return if (current != null) AssFeedStep.Restart(current) else AssFeedStep.Drop
++        }
++        return index.segmentAt(nowMs)?.let { AssFeedStep.Restart(it) } ?: AssFeedStep.Idle
++    }
++}
++
++/**
++ * Backfill after a restart: a caption without an End that started in an earlier segment may still
++ * be on screen. Walks back up to [MAX_SEGMENTS] segments, stopping at a program boundary or at the
++ * first segment holding a Dialogue.
++ */
++object AssBackfill {
++    const val MAX_SEGMENTS = 12
++
++    /**
++     * The segments before [startUri], newest first, that a backfill may fetch. Stops before
++     * stepping back out of a program's first segment. Reads [index]; call on its owner thread.
++     */
++    fun chain(index: AssSegmentIndex, startUri: String): List<AssSegmentLink> {
++        val out = ArrayList<AssSegmentLink>()
++        var link = index[startUri]
++        while (out.size < MAX_SEGMENTS) {
++            val current = link ?: break
++            val prevUri = current.prev ?: break
++            if (current.boundary) break
++            val prevLink = index[prevUri] ?: AssSegmentLink(
++                uri = prevUri,
++                startMs = current.startMs - current.prevDurationMs,
++                durationMs = current.prevDurationMs,
++                prev = null,
++                prevDurationMs = 0L,
++                boundary = false,
++                mapUri = current.mapUri,
++            )
++            out += prevLink
++            link = prevLink
++        }
++        return out
++    }
++
++    /**
++     * Fetch along [chain] until a segment holds a Dialogue. Returns the fetched segments
++     * oldest-first, or null when [cancelled] (a drop happened meanwhile; discard the result).
++     * [fetch] blocks and returns null on failure, which ends the walk. Thread-agnostic.
++     */
++    fun collect(
++        chain: List<AssSegmentLink>,
++        fetch: (String) -> String?,
++        cancelled: () -> Boolean,
++    ): List<Pair<AssSegmentLink, String>>? {
++        val found = ArrayList<Pair<AssSegmentLink, String>>()
++        for (link in chain) {
++            val text = fetch(link.uri)
++            if (cancelled()) return null
++            if (text == null) break
++            found.add(0, link to text)
++            if (AssSegmentParser.containsDialogue(text)) break
++        }
++        return found
++    }
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/ass/AssSegmentParser.kt b/app/src/main/java/kr/dcmys/komorebi/ass/AssSegmentParser.kt
+new file mode 100644
+index 0000000..c617c4f
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/ass/AssSegmentParser.kt
+@@ -0,0 +1,99 @@
++package kr.dcmys.komorebi.ass
++
++/** One Dialogue line, rebased to epoch ms. [endMs] is null when End is empty: the caption closes at the next caption start on any row (see [AssTimeline]). */
++data class AssDialogue(
++    val startMs: Long,
++    val endMs: Long?,
++    val layer: Int,
++    val style: String,
++    val name: String,
++    val marginL: Int,
++    val marginR: Int,
++    val marginV: Int,
++    val effect: String,
++    val text: String,
++)
++
++/**
++ * Each segment restarts its clock at 0 and carries its own `Format:` line, so Dialogue fields are
++ * read by name from it; the last format field keeps any commas.
++ */
++object AssSegmentParser {
++
++    private val TIME = Regex("""^(\d+):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$""")
++    private val DIALOGUE_LINE = Regex("""^Dialogue:""", setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE))
++
++    fun parseAssTimeMs(value: String): Long? {
++        val m = TIME.matchEntire(value.trim()) ?: return null
++        val frac = (m.groupValues[4]).padEnd(3, '0').substring(0, 3)
++        return m.groupValues[1].toLong() * 3_600_000L +
++            m.groupValues[2].toLong() * 60_000L +
++            m.groupValues[3].toLong() * 1_000L +
++            frac.toLong()
++    }
++
++    fun containsDialogue(text: String): Boolean = DIALOGUE_LINE.containsMatchIn(text)
++
++    fun parseDialogueLines(text: String, segmentStartMs: Long): List<AssDialogue> {
++        val out = ArrayList<AssDialogue>()
++        var section: String? = null
++        var fields: List<String>? = null
++
++        for (raw in text.removePrefix("\uFEFF").replace("\r\n", "\n").split('\n')) {
++            val line = raw.trim()
++            if (line.isEmpty()) continue
++            if (line.startsWith("[") && line.endsWith("]")) {
++                section = line.substring(1, line.length - 1)
++                continue
++            }
++            if (section != "Events") continue
++
++            if (line.startsWith("Format:", ignoreCase = true)) {
++                fields = line.substring(line.indexOf(':') + 1).split(',').map { it.trim() }
++                continue
++            }
++            val names = fields ?: continue
++            if (!line.startsWith("Dialogue:", ignoreCase = true)) continue
++
++            val parts = splitFields(line.substring(line.indexOf(':') + 1), names.size)
++            val row = HashMap<String, String>(names.size * 2)
++            for (i in names.indices) row[names[i]] = (parts.getOrNull(i) ?: "").trim()
++
++            val relStart = parseAssTimeMs(row["Start"] ?: "")
++            val endRaw = row["End"] ?: ""
++            val relEnd = if (endRaw.isEmpty()) null else parseAssTimeMs(endRaw)
++
++            out += AssDialogue(
++                startMs = segmentStartMs + (relStart ?: 0L),
++                endMs = relEnd?.let { segmentStartMs + it },
++                layer = num(row["Layer"]),
++                style = row["Style"] ?: "",
++                name = row["Name"] ?: "",
++                marginL = num(row["MarginL"]),
++                marginR = num(row["MarginR"]),
++                marginV = num(row["MarginV"]),
++                effect = row["Effect"] ?: "",
++                text = row["Text"] ?: "",
++            )
++        }
++        return out
++    }
++
++    private fun num(value: String?): Int = value?.trim()?.toDoubleOrNull()?.toInt() ?: 0
++
++    private fun splitFields(body: String, count: Int): List<String> {
++        val parts = ArrayList<String>(count)
++        var start = 0
++        for (i in 0 until count - 1) {
++            val comma = body.indexOf(',', start)
++            if (comma == -1) {
++                parts += body.substring(start)
++                return parts
++            }
++            parts += body.substring(start, comma)
++            start = comma + 1
++        }
++        parts += body.substring(start)
++        return parts
++    }
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/ass/AssSubtitleController.kt b/app/src/main/java/kr/dcmys/komorebi/ass/AssSubtitleController.kt
+new file mode 100644
+index 0000000..687abd0
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/ass/AssSubtitleController.kt
+@@ -0,0 +1,566 @@
++@file:OptIn(UnstableApi::class)
++
++package kr.dcmys.komorebi.ass
++
++import android.content.Context
++import android.os.Handler
++import android.os.Looper
++import android.os.SystemClock
++import android.util.Log
++import androidx.annotation.OptIn
++import androidx.media3.common.C
++import androidx.media3.common.MediaItem
++import androidx.media3.common.Player
++import androidx.media3.common.Timeline
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.ExoPlayer
++import androidx.media3.exoplayer.hls.HlsManifest
++import kotlinx.coroutines.CoroutineDispatcher
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import kr.dcmys.komorebi.platform.SystemCaptionStyle
++import okhttp3.CacheControl
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import java.io.IOException
++import kotlin.coroutines.CoroutineContext
++
++/**
++ * The subtitle rendition comes from the player's [HlsManifest]: the media3 fork keeps a
++ * `TYPE=SUBTITLES` rendition in `multivariantPlaylist.subtitles`, typed text/vtt, so it is confirmed
++ * as ASS by fetching its playlist. Event time = segment EXT-X-PROGRAM-DATE-TIME + local Start;
++ * playback time = `Timeline.Window.windowStartTimeMs + currentPosition`.
++ *
++ * All state lives on the player's application thread; network I/O runs on [Dispatchers.IO];
++ * libass runs on its own thread ([AssLibassRenderer]).
++ */
++class AssSubtitleController(
++    context: Context,
++    private val player: ExoPlayer,
++    private val httpClient: OkHttpClient,
++) {
++    private val playerLooper: Looper = player.applicationLooper
++    private val playerHandler = Handler(playerLooper)
++    private val scope = CoroutineScope(SupervisorJob() + LooperDispatcher(playerHandler))
++    private val window = Timeline.Window()
++
++    private val _available = MutableStateFlow(false)
++
++    val available: StateFlow<Boolean> = _available.asStateFlow()
++
++    private val _frame = MutableStateFlow<AssRenderedFrame?>(null)
++    internal val frame: StateFlow<AssRenderedFrame?> = _frame.asStateFlow()
++
++    @Volatile
++    private var enabledFlag = true
++
++    /** Captions on/off. Off clears the screen and stops fetching. Any thread. */
++    var enabled: Boolean
++        get() = enabledFlag
++        set(value) {
++            if (enabledFlag == value) return
++            enabledFlag = value
++            runOnPlayerThread { onEnabledChanged() }
++        }
++
++    @Volatile
++    private var borderMode = AssBorderMode.AUTHORED
++
++    /** Set from the overlay (main thread); rebuilds the libass track on its thread, keeping the fetched captions. */
++    var captionStyle: SystemCaptionStyle = SystemCaptionStyle.DEFAULT
++        set(value) {
++            if (field == value) return
++            field = value
++            val mode = AssScript.borderModeFor(value)
++            if (mode == borderMode) return
++            borderMode = mode
++            renderer.setBorderMode(mode)
++            // Queued after the rebuild on the libass thread: force the next frame to render.
++            runOnPlayerThread { if (!released) contentVersion++ }
++        }
++
++    private val renderer = AssLibassRenderer(context) { picture ->
++        _frame.value = if (enabledFlag && !released) picture else null
++    }
++
++    // --- Player-thread state ---
++    private val index = AssSegmentIndex()
++    private val planner = AssFeedPlanner(index)
++    private val timeline = AssTimeline()
++    private var candidateUrls: List<String> = emptyList()
++    private var assConfirmed = false
++    private var windowStartTimeMs = NO_TIME
++    private var headerUri: String? = null
++    private var headerText: String? = null
++    private var headerJob: Job? = null
++    private var pollJob: Job? = null
++    private var feedJob: Job? = null
++    private var submittedVersion = -1L
++    private var submittedHeader: String? = null
++    private var failedUri: String? = null
++    private var failedCount = 0
++
++    private var pendingBoundary: AssSegmentLink? = null
++    private var pendingHeaderText: String? = null
++    private var pendingHeaderJob: Job? = null
++
++    private var active = true
++
++    @Volatile
++    private var released = false
++
++    /** Bumped by every drop; fetches started before it are discarded. Read from I/O threads. */
++    @Volatile
++    private var generation = 0
++
++    // --- Published to the display thread ---
++    @Volatile
++    private var schedule: AssRenderSchedule? = null
++
++    @Volatile
++    private var contentVersion = 0L
++
++    @Volatile
++    private var snapshotWallMs = NO_TIME
++
++    @Volatile
++    private var snapshotElapsedMs = 0L
++
++    @Volatile
++    private var snapshotSpeed = 0f
++
++    // --- Display-thread state (the overlay's frame loop) ---
++    private var renderedVersion = -1L
++    private var stableFrom = 0L
++    private var stableUntil = 0L
++    private var viewportWidth = 0
++    private var viewportHeight = 0
++
++    private val listener = object : Player.Listener {
++        override fun onTimelineChanged(timeline: Timeline, reason: Int) {
++            onTimelineUpdated()
++        }
++
++        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
++            resetStream()
++            onTimelineUpdated()
++        }
++    }
++
++    init {
++        runOnPlayerThread {
++            if (!released && !player.isReleased) {
++                player.addListener(listener)
++                onTimelineUpdated()
++            }
++        }
++    }
++
++    fun release() {
++        runOnPlayerThread {
++            if (released) return@runOnPlayerThread
++            released = true
++            if (!player.isReleased) player.removeListener(listener)
++            scope.cancel()
++            renderer.release()
++            _frame.value = null
++            _available.value = false
++        }
++    }
++
++    /** Pausing forgets the stream; resuming rediscovers it from the player's manifest. Any thread. */
++    fun setActive(active: Boolean) {
++        runOnPlayerThread {
++            if (released || this.active == active) return@runOnPlayerThread
++            this.active = active
++            resetStream()
++            if (active) onTimelineUpdated()
++        }
++    }
++
++    private fun onTimelineUpdated() {
++        if (released || player.isReleased) return
++        windowStartTimeMs = readWindowStartTimeMs()
++        val manifest = player.currentManifest as? HlsManifest
++        val urls = manifest?.multivariantPlaylist?.subtitles
++            ?.mapNotNull { rendition -> rendition.url?.toString() }
++            .orEmpty()
++        if (active && urls != candidateUrls) {
++            resetStream()
++            candidateUrls = urls
++            if (urls.isNotEmpty()) {
++                pollJob = scope.launch { pollPlaylist(urls) }
++                feedJob = scope.launch { feedLoop() }
++            }
++        }
++        updateAvailable()
++    }
++
++    /** Epoch ms of window position 0 (live HLS with PDT), or [NO_TIME]. Allocation-free. */
++    private fun readWindowStartTimeMs(): Long {
++        val tl = player.currentTimeline
++        if (tl.isEmpty) return NO_TIME
++        val i = player.currentMediaItemIndex
++        if (i < 0 || i >= tl.windowCount) return NO_TIME
++        tl.getWindow(i, window)
++        if (window.isPlaceholder) return NO_TIME
++        val start = window.windowStartTimeMs
++        return if (start == C.TIME_UNSET) NO_TIME else start
++    }
++
++    private fun updateAvailable() {
++        _available.value = !released && assConfirmed && windowStartTimeMs != NO_TIME
++    }
++
++    private fun resetStream() {
++        pollJob?.cancel()
++        feedJob?.cancel()
++        headerJob?.cancel()
++        pollJob = null
++        feedJob = null
++        headerJob = null
++        generation++
++        candidateUrls = emptyList()
++        assConfirmed = false
++        index.clear()
++        planner.reset()
++        timeline.clear()
++        headerUri = null
++        headerText = null
++        failedUri = null
++        failedCount = 0
++        clearPendingBoundary()
++        publish()
++        // Cleared on the libass thread, after any render already queued for the old stream.
++        renderer.clear()
++        updateAvailable()
++    }
++
++    private suspend fun pollPlaylist(candidates: List<String>) {
++        // Confirm which subtitle rendition (if any) is Segmented-ASS. Done even when captions are
++        // disabled, so [available] can drive the UI toggle.
++        var url: String? = null
++        while (url == null) {
++            var anyFailed = false
++            for (candidate in candidates) {
++                val playlist = fetchPlaylist(candidate)
++                if (playlist == null) {
++                    anyFailed = true
++                } else if (playlist.isAss) {
++                    url = candidate
++                    index.ingest(playlist)
++                    break
++                }
++            }
++            if (url == null) {
++                if (!anyFailed) return
++                delay(RETRY_MS)
++            }
++        }
++        val assUrl: String = url ?: return
++        assConfirmed = true
++        updateAvailable()
++
++        while (scope.isActive) {
++            delay(index.targetDurationMs.coerceIn(MIN_POLL_MS, MAX_POLL_MS))
++            // Polled even while captions are off, so the index stays complete for a later seek
++            // back; only segment fetching is gated by [enabled].
++            val playlist = fetchPlaylist(assUrl) ?: continue
++            index.ingest(playlist)
++            if (playlist.endList) return
++        }
++    }
++
++    private suspend fun fetchPlaylist(url: String): AssMediaPlaylist? {
++        val text = fetchText(url, noCache = true) ?: return null
++        return AssPlaylistParser.parse(text, url)
++    }
++
++    private suspend fun feedLoop() {
++        while (scope.isActive) {
++            if (enabledFlag && assConfirmed) {
++                try {
++                    feedStep()
++                } catch (e: IOException) {
++                    Log.w(TAG, "caption feed step failed", e)
++                }
++            }
++            delay(nextFeedDelayMs())
++        }
++    }
++
++    /** The feed tick, shortened so a pending programme boundary is applied when it is played. */
++    private fun nextFeedDelayMs(): Long {
++        val boundary = pendingBoundary ?: return FEED_TICK_MS
++        val now = snapshotWallMs
++        if (now == NO_TIME) return FEED_TICK_MS
++        return (boundary.startMs - now).coerceIn(MIN_FEED_DELAY_MS, FEED_TICK_MS)
++    }
++
++    private suspend fun feedStep() {
++        val now = playbackWallClockOnPlayerThread()
++        if (now == NO_TIME) return
++        pendingBoundary?.let { if (now >= it.startMs) applyBoundary(it) }
++        timeline.prune(now - KEEP_BEHIND_MS)
++        planner.trimRangeStart(now - KEEP_BEHIND_MS)
++
++        when (val step = planner.plan(now)) {
++            AssFeedStep.Idle -> Unit
++            AssFeedStep.Drop -> dropCaptions()
++            is AssFeedStep.Restart -> {
++                dropCaptions()
++                val gen = generation
++                val link = step.link
++                val text = fetchText(link.uri, noCache = false) ?: return
++                if (gen != generation || !enabledFlag) return
++                appendSegment(link, text, backfilled = false, nowMs = now)
++                planner.markAppended(link)
++                publish()
++                // A caption without an End that started earlier may be on screen here.
++                val chain = AssBackfill.chain(index, link.uri)
++                if (chain.isEmpty()) return
++                val found = withContext(Dispatchers.IO) {
++                    AssBackfill.collect(chain, { blockingFetch(it, noCache = false) }, { gen != generation })
++                } ?: return
++                if (gen != generation || !enabledFlag) return
++                for ((l, t) in found) appendSegment(l, t, backfilled = true, nowMs = now)
++            }
++            is AssFeedStep.Append -> {
++                val gen = generation
++                val link = step.link
++                val text = fetchText(link.uri, noCache = false)
++                if (gen != generation || !enabledFlag) return
++                if (text == null) {
++                    // Retry on the next tick; give up on a segment that keeps failing.
++                    if (failedUri == link.uri) failedCount++ else { failedUri = link.uri; failedCount = 1 }
++                    if (failedCount < MAX_SEGMENT_FAILURES) return
++                    planner.markAppended(link)
++                    return
++                }
++                appendSegment(link, text, backfilled = false, nowMs = now)
++                planner.markAppended(link)
++            }
++        }
++        publish()
++    }
++
++    /**
++     * A programme's first segment resets the captions and reloads init.ass, but only once it is played:
++     * it is fetched up to two segments ahead, and resetting then would wipe the outgoing programme's
++     * caption early. Its events are added now and its header prefetched.
++     */
++    private fun appendSegment(link: AssSegmentLink, text: String, backfilled: Boolean, nowMs: Long) {
++        val map = link.mapUri
++        if (!backfilled && map != null) {
++            if (link.boundary) {
++                if (link.startMs <= nowMs) applyBoundary(link) else scheduleBoundary(link)
++            } else if (pendingBoundary == null) {
++                loadHeader(map, force = false)
++            }
++        }
++        timeline.addSegment(AssSegmentParser.parseDialogueLines(text, link.startMs))
++    }
++
++    private fun scheduleBoundary(link: AssSegmentLink) {
++        val map = link.mapUri ?: return
++        clearPendingBoundary()
++        pendingBoundary = link
++        pendingHeaderJob = scope.launch {
++            while (scope.isActive && pendingBoundary === link) {
++                val text = fetchText(map, noCache = true)
++                if (text != null) {
++                    if (pendingBoundary === link) pendingHeaderText = text
++                    return@launch
++                }
++                delay(RETRY_MS)
++            }
++        }
++    }
++
++    private fun applyBoundary(link: AssSegmentLink) {
++        val map = link.mapUri ?: return
++        val prefetched = if (pendingBoundary === link) pendingHeaderText else null
++        clearPendingBoundary()
++        timeline.resetAt(link.startMs)
++        if (prefetched != null) {
++            headerJob?.cancel()
++            headerUri = map
++            headerText = prefetched
++        } else {
++            loadHeader(map, force = true)
++        }
++        publish()
++    }
++
++    private fun clearPendingBoundary() {
++        pendingHeaderJob?.cancel()
++        pendingHeaderJob = null
++        pendingBoundary = null
++        pendingHeaderText = null
++    }
++
++    /**
++     * Fetch init.ass. Non-forced loads are de-duplicated by URL; a forced load (discontinuity)
++     * re-fetches, as the next program may reuse the same name with new content.
++     */
++    private fun loadHeader(uri: String, force: Boolean) {
++        if (!force && uri == headerUri) return
++        headerUri = uri
++        if (force) headerText = null // nothing renders until the new header arrives
++        headerJob?.cancel()
++        headerJob = scope.launch {
++            while (scope.isActive && headerUri == uri) {
++                val text = fetchText(uri, noCache = true)
++                if (text != null) {
++                    if (headerUri == uri) {
++                        headerText = text
++                        publish()
++                    }
++                    return@launch
++                }
++                delay(RETRY_MS)
++            }
++        }
++    }
++
++    private fun dropCaptions() {
++        generation++
++        clearPendingBoundary()
++        timeline.clear()
++        planner.reset()
++        failedUri = null
++        failedCount = 0
++        publish()
++    }
++
++    private fun onEnabledChanged() {
++        if (released) return
++        if (!enabledFlag) {
++            dropCaptions()
++            renderer.clear()
++            _frame.value = null
++        }
++    }
++
++    private fun publish() {
++        val header = headerText
++        if (timeline.version == submittedVersion && header === submittedHeader) return
++        submittedVersion = timeline.version
++        submittedHeader = header
++        val resolved = if (header == null) emptyList() else timeline.resolve()
++        renderer.submit(header, resolved)
++        schedule = AssRenderSchedule(resolved)
++        contentVersion++
++    }
++
++    /** Wall-clock (epoch ms) of the playback position, or [NO_TIME]. Player thread only. */
++    private fun playbackWallClockOnPlayerThread(): Long {
++        // The owner releases the player before it disposes this controller; never read it then.
++        if (player.isReleased) return NO_TIME
++        val start = readWindowStartTimeMs()
++        if (start == NO_TIME) return NO_TIME
++        val wall = AssScript.playbackWallClockMs(start, player.currentPosition, GLOBAL_OFFSET_MS)
++        snapshotWallMs = wall
++        snapshotElapsedMs = SystemClock.elapsedRealtime()
++        snapshotSpeed = if (player.isPlaying) player.playbackParameters.speed else 0f
++        return wall
++    }
++
++    /** Same, from another thread: extrapolated from the last player-thread reading. */
++    private fun extrapolatedWallClock(): Long {
++        val wall = snapshotWallMs
++        if (wall == NO_TIME) return NO_TIME
++        return wall + ((SystemClock.elapsedRealtime() - snapshotElapsedMs) * snapshotSpeed).toLong()
++    }
++
++    internal fun onDisplayFrame() {
++        if (!enabledFlag || viewportWidth <= 0) return
++        val version = contentVersion // read before the schedule (see publish order)
++        val sched = schedule ?: return
++        val now = if (Looper.myLooper() == playerLooper) {
++            playbackWallClockOnPlayerThread()
++        } else {
++            extrapolatedWallClock()
++        }
++        if (now == NO_TIME) return
++        if (version == renderedVersion && now >= stableFrom && now < stableUntil) return
++        renderedVersion = version
++        stableFrom = sched.stableFrom(now)
++        stableUntil = sched.stableUntil(now)
++        renderer.requestRender(now)
++    }
++
++    /** Size in pixels of the overlay; captions are rendered at it (capped) and scaled to fit. */
++    internal fun setViewportSize(width: Int, height: Int) {
++        if (width <= 0 || height <= 0) return
++        var w = width
++        var h = height
++        if (w > MAX_RENDER_WIDTH) {
++            h = (h.toLong() * MAX_RENDER_WIDTH / w).toInt().coerceAtLeast(1)
++            w = MAX_RENDER_WIDTH
++        }
++        if (w == viewportWidth && h == viewportHeight) return
++        viewportWidth = w
++        viewportHeight = h
++        renderer.setFrameSize(w, h)
++        renderedVersion = -1L // force a render at the new size
++    }
++
++    private suspend fun fetchText(url: String, noCache: Boolean): String? =
++        withContext(Dispatchers.IO) { blockingFetch(url, noCache) }
++
++    private fun blockingFetch(url: String, noCache: Boolean): String? = try {
++        val builder = Request.Builder().url(url)
++        if (noCache) builder.cacheControl(CacheControl.FORCE_NETWORK)
++        httpClient.newCall(builder.build()).execute().use { response ->
++            if (response.isSuccessful) response.body?.string() else null
++        }
++    } catch (e: IOException) {
++        null
++    } catch (e: IllegalArgumentException) {
++        null
++    }
++
++    private fun runOnPlayerThread(block: () -> Unit) {
++        if (Looper.myLooper() == playerLooper) block() else playerHandler.post { block() }
++    }
++
++    private class LooperDispatcher(private val handler: Handler) : CoroutineDispatcher() {
++        override fun isDispatchNeeded(context: CoroutineContext): Boolean =
++            Looper.myLooper() != handler.looper
++
++        override fun dispatch(context: CoroutineContext, block: Runnable) {
++            handler.post(block)
++        }
++    }
++
++    companion object {
++        private const val TAG = "AssSubtitleController"
++
++        /**
++         * Global caption offset in ms, applied to the playback wall clock. Positive shows captions
++         * later. Tune here if the subtitle PDT and the video PDT anchors turn out to differ.
++         */
++        const val GLOBAL_OFFSET_MS = 0L
++
++        private const val NO_TIME = Long.MIN_VALUE
++        private const val FEED_TICK_MS = 500L
++        private const val MIN_FEED_DELAY_MS = 10L
++        private const val RETRY_MS = 5_000L
++        private const val MIN_POLL_MS = 1_000L
++        private const val MAX_POLL_MS = 10_000L
++        private const val KEEP_BEHIND_MS = 60_000L
++        private const val MAX_SEGMENT_FAILURES = 3
++        private const val MAX_RENDER_WIDTH = 1920
++    }
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/ass/AssSubtitleOverlay.kt b/app/src/main/java/kr/dcmys/komorebi/ass/AssSubtitleOverlay.kt
+new file mode 100644
+index 0000000..3f44c93
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/ass/AssSubtitleOverlay.kt
+@@ -0,0 +1,52 @@
++package kr.dcmys.komorebi.ass
++
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.withFrameNanos
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.drawBehind
++import androidx.compose.ui.graphics.FilterQuality
++import androidx.compose.ui.layout.onSizeChanged
++import androidx.compose.ui.unit.IntOffset
++import androidx.compose.ui.unit.IntSize
++import kotlin.math.roundToInt
++
++/**
++ * Draws the current picture scaled to this composable's bounds. The picture state is read in the
++ * draw phase only, so a new picture redraws without recomposition.
++ */
++@Composable
++fun AssSubtitleOverlay(controller: AssSubtitleController, modifier: Modifier = Modifier) {
++    val frameState = controller.frame.collectAsState()
++    val available by controller.available.collectAsState()
++    val onFrame: (Long) -> Unit = remember(controller) { { _: Long -> controller.onDisplayFrame() } }
++
++    LaunchedEffect(controller, available) {
++        if (!available) return@LaunchedEffect
++        while (true) withFrameNanos(onFrame)
++    }
++
++    Spacer(
++        modifier
++            .onSizeChanged { controller.setViewportSize(it.width, it.height) }
++            .drawBehind {
++                val picture = frameState.value ?: return@drawBehind
++                if (picture.frameWidth <= 0 || picture.frameHeight <= 0) return@drawBehind
++                val sx = size.width / picture.frameWidth
++                val sy = size.height / picture.frameHeight
++                drawImage(
++                    image = picture.image,
++                    dstOffset = IntOffset((picture.left * sx).roundToInt(), (picture.top * sy).roundToInt()),
++                    dstSize = IntSize(
++                        (picture.image.width * sx).roundToInt(),
++                        (picture.image.height * sy).roundToInt(),
++                    ),
++                    filterQuality = FilterQuality.Medium,
++                )
++            },
++    )
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/ass/AssTimeline.kt b/app/src/main/java/kr/dcmys/komorebi/ass/AssTimeline.kt
+new file mode 100644
+index 0000000..d9d9c79
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/ass/AssTimeline.kt
+@@ -0,0 +1,125 @@
++package kr.dcmys.komorebi.ass
++
++import java.util.TreeSet
++
++/** A Dialogue whose end is resolved; [open] marks a placeholder end (no later caption known yet). */
++data class AssResolvedEvent(
++    val dialogue: AssDialogue,
++    val startMs: Long,
++    val endMs: Long,
++    val open: Boolean,
++)
++
++/**
++ * - Every Dialogue start (any row, including empty-text "clear" rows) is a caption boundary.
++ * - A Dialogue with an empty End ends at the first known boundary strictly after its start; rows
++ *   sharing a start therefore close together. Until one is known it gets [OPEN_DURATION_MS].
++ *
++ * Ends are resolved lazily, so segments may arrive out of order (backfill adds older ones last).
++ * Not thread-safe; owned by a single thread.
++ */
++class AssTimeline {
++
++    private val events = ArrayList<AssDialogue>()
++    private val captionStarts = TreeSet<Long>()
++
++    /** Bumped on every change; consumers rebuild the renderer when it moves. */
++    var version: Long = 0
++        private set
++
++    val size: Int get() = events.size
++
++    fun addSegment(dialogues: List<AssDialogue>) {
++        if (dialogues.isEmpty()) return
++        for (d in dialogues) captionStarts.add(d.startMs)
++        events.addAll(dialogues)
++        version++
++    }
++
++    fun clear() {
++        if (events.isEmpty() && captionStarts.isEmpty()) return
++        events.clear()
++        captionStarts.clear()
++        version++
++    }
++
++    /**
++     * Programme boundary: drop the previous programme's events and caption boundaries (those
++     * before [boundaryStartMs]); the new programme's, possibly appended ahead, are kept.
++     */
++    fun resetAt(boundaryStartMs: Long) {
++        events.removeAll { it.startMs < boundaryStartMs }
++        captionStarts.headSet(boundaryStartMs, false).clear()
++        version++
++    }
++
++    fun closingTimeOf(dialogue: AssDialogue): Long? =
++        dialogue.endMs ?: captionStarts.higher(dialogue.startMs)
++
++    fun resolve(): List<AssResolvedEvent> {
++        val out = ArrayList<AssResolvedEvent>(events.size)
++        for (d in events) {
++            val end = closingTimeOf(d)
++            out += AssResolvedEvent(d, d.startMs, end ?: (d.startMs + OPEN_DURATION_MS), end == null)
++        }
++        return out
++    }
++
++    /**
++     * Drops events that ended at or before [cutoffMs]. A surviving event that started earlier ends at
++     * a boundary at/after the cutoff, so removing earlier boundaries never changes it.
++     */
++    fun prune(cutoffMs: Long) {
++        val before = events.size
++        events.removeAll { d -> (closingTimeOf(d) ?: Long.MAX_VALUE) <= cutoffMs }
++        val startsBefore = captionStarts.size
++        captionStarts.headSet(cutoffMs, false).clear()
++        if (events.size > MAX_EVENTS) {
++            events.sortBy { it.startMs }
++            events.subList(0, events.size - MAX_EVENTS).clear()
++        }
++        if (events.size != before || captionStarts.size != startsBefore) version++
++    }
++
++    companion object {
++        const val OPEN_DURATION_MS = 3_600_000L
++        private const val MAX_EVENTS = 2_000
++    }
++}
++
++/**
++ * The picture can only change when playback crosses an event start or end (the measured ARIB tags
++ * are static), or on every frame while an animated event is on screen. Pure; allocation-free.
++ */
++class AssRenderSchedule(events: List<AssResolvedEvent>) {
++
++    private val starts = LongArray(events.size) { events[it].startMs }
++    private val ends = LongArray(events.size) { events[it].endMs }
++    private val animated = BooleanArray(events.size) { isAnimated(events[it].dialogue.text) }
++
++    fun stableFrom(t: Long): Long {
++        var from = Long.MIN_VALUE
++        for (i in starts.indices) {
++            if (starts[i] in (from + 1)..t) from = starts[i]
++            if (ends[i] in (from + 1)..t) from = ends[i]
++        }
++        return from
++    }
++
++    /** End (exclusive) of the stable interval holding [t]; `t + 1` while an animated event shows. */
++    fun stableUntil(t: Long): Long {
++        var until = Long.MAX_VALUE
++        for (i in starts.indices) {
++            if (animated[i] && starts[i] <= t && t < ends[i]) return t + 1
++            if (starts[i] > t && starts[i] < until) until = starts[i]
++            if (ends[i] > t && ends[i] < until) until = ends[i]
++        }
++        return until
++    }
++
++    companion object {
++        private val ANIMATION_TAG = Regex("""\\(?:t\(|move\(|fade?\(|k[fo]?\d|K\d)""")
++
++        fun isAnimated(text: String): Boolean = ANIMATION_TAG.containsMatchIn(text)
++    }
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/ass/IptvAssOverlay.kt b/app/src/main/java/kr/dcmys/komorebi/ass/IptvAssOverlay.kt
+new file mode 100644
+index 0000000..fdc0223
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/ass/IptvAssOverlay.kt
+@@ -0,0 +1,171 @@
++@file:OptIn(UnstableApi::class)
++
++package kr.dcmys.komorebi.ass
++
++import androidx.annotation.OptIn
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.SideEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberUpdatedState
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.TransformOrigin
++import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.layout.layout
++import androidx.compose.ui.platform.LocalContext
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleEventObserver
++import androidx.lifecycle.compose.LocalLifecycleOwner
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.ExoPlayer
++import com.beeregg2001.komorebi.ui.live.LivePlayerState
++import com.beeregg2001.komorebi.ui.live.ZoomOrigin
++import dagger.hilt.EntryPoint
++import dagger.hilt.InstallIn
++import dagger.hilt.android.EntryPointAccessors
++import dagger.hilt.components.SingletonComponent
++import kr.dcmys.komorebi.iptv.IptvHttp
++import kr.dcmys.komorebi.platform.rememberSystemCaptionStyle
++import okhttp3.OkHttpClient
++import kotlin.math.abs
++
++/** Gives composables the plain IPTV HTTP client (the app's default client rewrites hosts). */
++@EntryPoint
++@InstallIn(SingletonComponent::class)
++interface AssHttpEntryPoint {
++    @IptvHttp
++    fun iptvHttpClient(): OkHttpClient
++}
++
++/**
++ * One [AssSubtitleController] per player instance, released when the player changes or this leaves
++ * the composition. Keep it composed while captions are hidden so the controller (and its subtitle
++ * index) survives UI toggles; [visible] only decides whether the picture is drawn.
++ *
++ * @param modifier must size this overlay to the displayed video rectangle.
++ */
++@Composable
++fun IptvAssOverlay(
++    player: ExoPlayer?,
++    enabled: Boolean,
++    visible: Boolean,
++    modifier: Modifier = Modifier,
++) {
++    if (player == null) return
++    val context = LocalContext.current
++    val lifecycleOwner = LocalLifecycleOwner.current
++    val httpClient = remember {
++        EntryPointAccessors.fromApplication(context.applicationContext, AssHttpEntryPoint::class.java)
++            .iptvHttpClient()
++    }
++    val currentEnabled by rememberUpdatedState(enabled)
++    val captionStyle = rememberSystemCaptionStyle()
++    val currentCaptionStyle by rememberUpdatedState(captionStyle)
++    var controller by remember(player) { mutableStateOf<AssSubtitleController?>(null) }
++
++    // Created in an effect (not during composition) so an abandoned composition leaks nothing.
++    DisposableEffect(player, lifecycleOwner) {
++        if (player.isReleased) return@DisposableEffect onDispose {}
++        val c = AssSubtitleController(context, player, httpClient)
++        c.enabled = currentEnabled
++        c.captionStyle = currentCaptionStyle
++        controller = c
++        // The screen releases its players on ON_STOP; pausing here too keeps the controller
++        // from touching the network (or the player) while the app is in the background.
++        val observer = LifecycleEventObserver { _, event ->
++            when (event) {
++                Lifecycle.Event.ON_STOP -> c.setActive(false)
++                Lifecycle.Event.ON_START -> c.setActive(true)
++                else -> Unit
++            }
++        }
++        lifecycleOwner.lifecycle.addObserver(observer)
++        onDispose {
++            lifecycleOwner.lifecycle.removeObserver(observer)
++            c.release()
++        }
++    }
++
++    val c = controller ?: return
++    SideEffect {
++        c.enabled = enabled
++        c.captionStyle = captionStyle
++    }
++    if (visible) AssSubtitleOverlay(c, modifier)
++}
++
++/**
++ * Mirrors LivePlayerScreen's resize-mode choice (FILL for 1440x1080 with square pixels or any
++ * ratio >= 1.7, else FIT) and AspectRatioFrameLayout's FIT measurement (display aspect
++ * `width * pixelWidthHeightRatio / height`, 1% tolerance, centred).
++ */
++fun Modifier.liveVideoRect(
++    state: LivePlayerState,
++    videoWidth: Int,
++    videoHeight: Int,
++    pixelWidthHeightRatio: Float,
++): Modifier = this
++    .fillMaxSize()
++    .graphicsLayer {
++        if (state.lCropEnabled) {
++            scaleX = state.lCropZoom / 100f
++            scaleY = state.lCropZoom / 100f
++            translationX = size.width * (state.lCropX / 100f)
++            translationY = size.height * (state.lCropY / 100f)
++            transformOrigin = when (state.lCropOrigin) {
++                ZoomOrigin.TopLeft -> TransformOrigin(0f, 0f)
++                ZoomOrigin.TopRight -> TransformOrigin(1f, 0f)
++                ZoomOrigin.BottomLeft -> TransformOrigin(0f, 1f)
++                ZoomOrigin.BottomRight -> TransformOrigin(1f, 1f)
++            }
++        } else {
++            scaleX = 1f
++            scaleY = 1f
++            translationX = 0f
++            translationY = 0f
++            transformOrigin = TransformOrigin.Center
++        }
++    }
++    .layout { measurable, constraints ->
++        val width = constraints.maxWidth
++        val height = constraints.maxHeight
++        val (w, h) = if (constraints.hasBoundedWidth && constraints.hasBoundedHeight) {
++            fitVideoRect(width, height, videoWidth, videoHeight, pixelWidthHeightRatio)
++        } else {
++            constraints.minWidth to constraints.minHeight
++        }
++        val placeable = measurable.measure(constraints.copy(minWidth = w, maxWidth = w, minHeight = h, maxHeight = h))
++        layout(width, height) { placeable.place((width - w) / 2, (height - h) / 2) }
++    }
++
++internal fun fitVideoRect(
++    viewWidth: Int,
++    viewHeight: Int,
++    videoWidth: Int,
++    videoHeight: Int,
++    pixelWidthHeightRatio: Float,
++): Pair<Int, Int> {
++    if (viewWidth <= 0 || viewHeight <= 0 || videoWidth <= 0 || videoHeight <= 0) return viewWidth to viewHeight
++    val isAnamorphic = videoWidth == 1440 && videoHeight == 1080 && pixelWidthHeightRatio == 1.0f
++    val storageRatio = videoWidth.toFloat() / videoHeight.toFloat()
++    if (isAnamorphic || storageRatio >= FILL_MIN_RATIO) return viewWidth to viewHeight
++    val videoAspect = videoWidth * pixelWidthHeightRatio / videoHeight
++    if (!(videoAspect > 0f) || !videoAspect.isFinite()) return viewWidth to viewHeight
++    val deformation = videoAspect / (viewWidth.toFloat() / viewHeight) - 1
++    if (abs(deformation) <= MAX_ASPECT_DEFORMATION) return viewWidth to viewHeight
++    return if (deformation > 0) {
++        viewWidth to (viewWidth / videoAspect).toInt()
++    } else {
++        (viewHeight * videoAspect).toInt() to viewHeight
++    }
++}
++
++/** LivePlayerScreen switches the PlayerView to RESIZE_MODE_FILL at or above this ratio. */
++private const val FILL_MIN_RATIO = 1.7f
++
++/** AspectRatioFrameLayout.MAX_ASPECT_RATIO_DEFORMATION_FRACTION. */
++private const val MAX_ASPECT_DEFORMATION = 0.01f
+diff --git a/app/src/main/java/kr/dcmys/komorebi/platform/AribCaptionSystemStyle.kt b/app/src/main/java/kr/dcmys/komorebi/platform/AribCaptionSystemStyle.kt
+new file mode 100644
+index 0000000..86874d9
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/platform/AribCaptionSystemStyle.kt
+@@ -0,0 +1,14 @@
++package kr.dcmys.komorebi.platform
++
++/**
++ * The caption decoders have no Compose or Context access, so the caption overlay publishes the live
++ * [SystemCaptionStyle] here and each decoder applies it before decoding the next packet.
++ */
++object AribCaptionSystemStyle {
++    @Volatile
++    var current: SystemCaptionStyle = SystemCaptionStyle.DEFAULT
++
++    /** The edge type is not mapped: the renderer always forces stroked text, its only edge. */
++    val noBackground: Boolean
++        get() = current.transparentBackground
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/platform/SystemCaptionStyle.kt b/app/src/main/java/kr/dcmys/komorebi/platform/SystemCaptionStyle.kt
+new file mode 100644
+index 0000000..cf0e600
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/platform/SystemCaptionStyle.kt
+@@ -0,0 +1,66 @@
++package kr.dcmys.komorebi.platform
++
++import android.content.Context
++import android.graphics.Color
++import android.view.accessibility.CaptioningManager
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.platform.LocalContext
++
++/**
++ * Text colour, typeface and font scale are deliberately excluded: ARIB text colour carries meaning
++ * (speaker, emphasis), and resizing glyphs breaks the fixed caption layout and ruby placement.
++ */
++data class SystemCaptionStyle(
++    val transparentBackground: Boolean = false,
++    val edge: Edge = Edge.NONE,
++) {
++    enum class Edge { NONE, OUTLINE, DROP_SHADOW }
++
++    companion object {
++        val DEFAULT = SystemCaptionStyle()
++
++        fun from(style: CaptioningManager.CaptionStyle): SystemCaptionStyle {
++            val transparentBackground =
++                style.hasBackgroundColor() && Color.alpha(style.backgroundColor) == 0
++            val transparentWindow =
++                style.hasWindowColor() && Color.alpha(style.windowColor) == 0
++            val edge = when {
++                !style.hasEdgeType() -> Edge.NONE
++                style.edgeType == CaptioningManager.CaptionStyle.EDGE_TYPE_OUTLINE -> Edge.OUTLINE
++                style.edgeType == CaptioningManager.CaptionStyle.EDGE_TYPE_DROP_SHADOW -> Edge.DROP_SHADOW
++                else -> Edge.NONE
++            }
++            return SystemCaptionStyle(transparentBackground || transparentWindow, edge)
++        }
++
++        fun current(context: Context): SystemCaptionStyle = try {
++            val manager = context.getSystemService(Context.CAPTIONING_SERVICE) as? CaptioningManager
++            manager?.userStyle?.let(::from) ?: DEFAULT
++        } catch (e: RuntimeException) {
++            DEFAULT
++        }
++    }
++}
++
++@Composable
++fun rememberSystemCaptionStyle(): SystemCaptionStyle {
++    val context = LocalContext.current.applicationContext
++    var style by remember { mutableStateOf(SystemCaptionStyle.current(context)) }
++    DisposableEffect(context) {
++        val manager = context.getSystemService(Context.CAPTIONING_SERVICE) as? CaptioningManager
++        val listener = object : CaptioningManager.CaptioningChangeListener() {
++            override fun onUserStyleChanged(userStyle: CaptioningManager.CaptionStyle) {
++                style = SystemCaptionStyle.from(userStyle)
++            }
++        }
++        manager?.addCaptioningChangeListener(listener)
++        style = SystemCaptionStyle.current(context)
++        onDispose { manager?.removeCaptioningChangeListener(listener) }
++    }
++    return style
++}
+diff --git a/app/src/test/java/kr/dcmys/komorebi/ass/AssCaptionStyleTest.kt b/app/src/test/java/kr/dcmys/komorebi/ass/AssCaptionStyleTest.kt
+new file mode 100644
+index 0000000..d40dc74
+--- /dev/null
++++ b/app/src/test/java/kr/dcmys/komorebi/ass/AssCaptionStyleTest.kt
+@@ -0,0 +1,72 @@
++package kr.dcmys.komorebi.ass
++
++import kr.dcmys.komorebi.platform.SystemCaptionStyle
++import kr.dcmys.komorebi.platform.SystemCaptionStyle.Edge
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class AssCaptionStyleTest {
++
++    // The server's real init.ass style (BorderStyle 4 box, Outline 0, Shadow 4).
++    private val initAss = "[Script Info]\r\nScriptType: v4.00+\r\nPlayResX: 960\r\nPlayResY: 540\r\n\r\n" +
++        "[V4+ Styles]\r\n" +
++        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, " +
++        "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, " +
++        "MarginR, MarginV, Encoding\r\n" +
++        "Style: Default,WadaLabChuMaruGo2004ARIB,36,&Hffffff,&Hffffff,&H0,&H0,0,0,0,0,100,100,0,0,4,0,4,2,10,10,10,0\r\n\r\n"
++
++    private fun styleLine(header: String): String = header.lines().single { it.startsWith("Style:") }
++
++    private fun line(borderStyle: String, outline: String, shadow: String) =
++        "Style: Default,WadaLabChuMaruGo2004ARIB,36,&Hffffff,&Hffffff,&H00000000,&H00000000,0,0,0,0,100,100,0,0," +
++            "$borderStyle,$outline,$shadow,2,10,10,10,0"
++
++    @Test
++    fun mapping() {
++        assertEquals(AssBorderMode.AUTHORED, AssScript.borderModeFor(SystemCaptionStyle.DEFAULT))
++        assertEquals(AssBorderMode.AUTHORED, AssScript.borderModeFor(SystemCaptionStyle(false, Edge.DROP_SHADOW)))
++        assertEquals(AssBorderMode.BOX_OUTLINE, AssScript.borderModeFor(SystemCaptionStyle(false, Edge.OUTLINE)))
++        assertEquals(AssBorderMode.OUTLINE, AssScript.borderModeFor(SystemCaptionStyle(true, Edge.NONE)))
++        assertEquals(AssBorderMode.OUTLINE, AssScript.borderModeFor(SystemCaptionStyle(true, Edge.OUTLINE)))
++        assertEquals(AssBorderMode.SHADOW, AssScript.borderModeFor(SystemCaptionStyle(true, Edge.DROP_SHADOW)))
++    }
++
++    @Test
++    fun defaultIsByteForByteTheExistingRewrite() {
++        val font = AssLibassRenderer.ARIB_FONT_FAMILY
++        val before = "[Script Info]\nScriptType: v4.00+\nPlayResX: 960\nPlayResY: 540\n\n[V4+ Styles]\n" +
++            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, " +
++            "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, " +
++            "MarginR, MarginV, Encoding\n" + line("4", "0", "4") + "\n\n[Events]\n" + AssScript.EVENTS_FORMAT + "\n"
++        assertEquals(before, AssScript.prepareHeader(initAss, font, AssBorderMode.AUTHORED))
++        assertEquals(before, AssScript.prepareHeader(initAss, font))
++    }
++
++    @Test
++    fun transparentBackgroundUsesMediaFeOutline() {
++        assertEquals(line("1", "2", "0"), styleLine(AssScript.prepareHeader(initAss, null, AssBorderMode.OUTLINE)))
++    }
++
++    @Test
++    fun transparentBackgroundWithDropShadowUsesMediaFeShadow() {
++        assertEquals(line("1", "0", "1"), styleLine(AssScript.prepareHeader(initAss, null, AssBorderMode.SHADOW)))
++    }
++
++    @Test
++    fun boxKeptWithOutlineAddsGlyphOutline() {
++        assertEquals(line("4", "2", "4"), styleLine(AssScript.prepareHeader(initAss, null, AssBorderMode.BOX_OUTLINE)))
++        val bs1 = initAss.replace(",4,0,4,2,", ",1,0,4,2,")
++        assertEquals(line("1", "2", "0"), styleLine(AssScript.prepareHeader(bs1, null, AssBorderMode.BOX_OUTLINE)))
++        val bs3 = initAss.replace(",4,0,4,2,", ",3,0,4,2,")
++        assertEquals(line("3", "0", "4"), styleLine(AssScript.prepareHeader(bs3, null, AssBorderMode.BOX_OUTLINE)))
++    }
++
++    @Test
++    fun onlyBorderFieldsChange() {
++        val authored = styleLine(AssScript.prepareHeader(initAss, null)).split(',')
++        for (mode in AssBorderMode.values()) {
++            val v = styleLine(AssScript.prepareHeader(initAss, null, mode)).split(',')
++            for (i in authored.indices) if (i !in 15..17) assertEquals("$mode field $i", authored[i], v[i])
++        }
++    }
++}
+diff --git a/app/src/test/java/kr/dcmys/komorebi/ass/AssFeedTest.kt b/app/src/test/java/kr/dcmys/komorebi/ass/AssFeedTest.kt
+new file mode 100644
+index 0000000..1a5a1ac
+--- /dev/null
++++ b/app/src/test/java/kr/dcmys/komorebi/ass/AssFeedTest.kt
+@@ -0,0 +1,168 @@
++package kr.dcmys.komorebi.ass
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class AssFeedTest {
++
++    private val base = "https://cdn.example.com/arib_ass/"
++    private val t0 = 1_800_000_000_000L
++
++    private fun line(start: String, text: String) =
++        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n" +
++            "Dialogue: 0,$start,,Default,,0,0,0,,$text\n"
++
++    /** A playlist of 5 s segments named by [names]; segment i starts at t0 + startIndex*5 s + i*5 s. */
++    private fun playlist(names: List<String>, startIndex: Int, boundaryAt: String? = null): AssMediaPlaylist {
++        val sb = StringBuilder("#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MAP:URI=\"init.ass\"\n")
++        names.forEachIndexed { i, n ->
++            if (n == boundaryAt) sb.append("#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"init2.ass\"\n")
++            val pdt = t0 + (startIndex + i) * 5_000L
++            sb.append("#EXTINF:5.000000,\n#EXT-X-PROGRAM-DATE-TIME:").append(iso(pdt)).append('\n').append(n).append('\n')
++        }
++        return AssPlaylistParser.parse(sb.toString(), base + "stream.m3u8")
++    }
++
++    private fun iso(ms: Long): String {
++        val f = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", java.util.Locale.US)
++        f.timeZone = java.util.TimeZone.getTimeZone("UTC")
++        return f.format(java.util.Date(ms))
++    }
++
++    private val files = mapOf(
++        "a.ass" to line("0:00:02.00", "carried"), // t0 + 2 s, still on screen in c
++        "b.ass" to "[Events]\n",
++        "c.ass" to line("0:00:03.00", "next"), // t0 + 13 s
++        "d.ass" to "[Events]\n",
++    )
++
++    @Test
++    fun refreshKeepsPredecessorLearnedEarlier() {
++        val index = AssSegmentIndex()
++        index.ingest(playlist(listOf("a.ass", "b.ass", "c.ass"), 0))
++        index.ingest(playlist(listOf("b.ass", "c.ass", "d.ass"), 1))
++        assertEquals(base + "a.ass", index[base + "b.ass"]!!.prev)
++        assertEquals(base + "b.ass", index[base + "c.ass"]!!.prev)
++        assertEquals(base + "d.ass", index.nextOf(base + "c.ass")!!.uri)
++        assertEquals(4, index.size)
++        assertEquals(base + "c.ass", index.segmentAt(t0 + 12_000L)!!.uri)
++        assertNull(index.segmentAt(t0 - 1L))
++        assertNull(index.segmentAt(t0 + 60_000L))
++    }
++
++    @Test
++    fun indexIsBounded() {
++        val index = AssSegmentIndex(limit = 3)
++        index.ingest(playlist(listOf("a.ass", "b.ass", "c.ass", "d.ass", "e.ass"), 0))
++        assertEquals(3, index.size)
++        assertNull(index[base + "a.ass"])
++    }
++
++    @Test
++    fun backfillLooksBackUntilASegmentWithACaption() {
++        val index = AssSegmentIndex()
++        index.ingest(playlist(listOf("a.ass", "b.ass", "c.ass"), 0))
++        index.ingest(playlist(listOf("b.ass", "c.ass", "d.ass"), 1))
++
++        val fetched = ArrayList<String>()
++        val chain = AssBackfill.chain(index, base + "c.ass")
++        val found = AssBackfill.collect(chain, { u -> fetched += u.substringAfterLast('/'); files[u.substringAfterLast('/')] }, { false })!!
++        assertEquals(listOf("b.ass", "a.ass"), fetched)
++        assertEquals(listOf("a.ass", "b.ass"), found.map { it.first.uri.substringAfterLast('/') })
++
++        val timeline = AssTimeline()
++        timeline.addSegment(AssSegmentParser.parseDialogueLines(files.getValue("c.ass"), index[base + "c.ass"]!!.startMs))
++        for ((link, text) in found) timeline.addSegment(AssSegmentParser.parseDialogueLines(text, link.startMs))
++        val carried = timeline.resolve().single { it.dialogue.text == "carried" }
++        assertEquals(t0 + 2_000L, carried.startMs)
++        assertEquals(11_000L, carried.endMs - carried.startMs)
++    }
++
++    @Test
++    fun backfillDoesNotLookIntoThePreviousProgram() {
++        val index = AssSegmentIndex()
++        index.ingest(playlist(listOf("a.ass", "b.ass", "c.ass"), 0, boundaryAt = "c.ass"))
++        assertTrue(index[base + "c.ass"]!!.boundary)
++        assertEquals(base + "init2.ass", index[base + "c.ass"]!!.mapUri)
++        assertEquals(base + "init.ass", index[base + "b.ass"]!!.mapUri)
++        assertTrue(AssBackfill.chain(index, base + "c.ass").isEmpty())
++        index.ingest(playlist(listOf("a.ass", "b.ass", "c.ass", "d.ass"), 0, boundaryAt = "c.ass"))
++        assertEquals(listOf(base + "c.ass"), AssBackfill.chain(index, base + "d.ass").map { it.uri })
++    }
++
++    @Test
++    fun backfillIsBoundedAndCancellable() {
++        val index = AssSegmentIndex()
++        val names = (0 until 20).map { "s$it.ass" }
++        index.ingest(playlist(names, 0))
++        val chain = AssBackfill.chain(index, base + "s19.ass")
++        assertEquals(AssBackfill.MAX_SEGMENTS, chain.size)
++        assertEquals(base + "s18.ass", chain.first().uri)
++        var calls = 0
++        assertNull(AssBackfill.collect(chain, { calls++; "[Events]\n" }, { calls >= 2 }))
++        assertEquals(2, calls)
++        assertTrue(AssBackfill.collect(chain, { null }, { false })!!.isEmpty())
++    }
++
++    @Test
++    fun plannerFetchesNearThePositionOnly() {
++        val index = AssSegmentIndex()
++        val names = (0 until 120).map { "s$it.ass" }
++        index.ingest(playlist(names, 0))
++        val planner = AssFeedPlanner(index)
++
++        val now = t0 + 50 * 5_000L + 1_000L // inside s50
++        val first = planner.plan(now)
++        assertTrue(first is AssFeedStep.Restart)
++        assertEquals(base + "s50.ass", (first as AssFeedStep.Restart).link.uri)
++        planner.markAppended(first.link)
++
++        val appended = ArrayList<String>()
++        while (true) {
++            val step = planner.plan(now)
++            if (step !is AssFeedStep.Append) {
++                assertEquals(AssFeedStep.Idle, step)
++                break
++            }
++            appended += step.link.uri.substringAfterLast('/')
++            planner.markAppended(step.link)
++        }
++        assertEquals(listOf("s51.ass", "s52.ass"), appended)
++
++        assertEquals(AssFeedStep.Idle, planner.plan(now - 500L))
++        val back = planner.plan(t0 + 10 * 5_000L)
++        assertTrue(back is AssFeedStep.Restart)
++        assertEquals(base + "s10.ass", (back as AssFeedStep.Restart).link.uri)
++    }
++
++    @Test
++    fun plannerDropsWhenPlaybackLeavesTheRangeWithNoSegmentThere() {
++        val index = AssSegmentIndex()
++        index.ingest(playlist(listOf("a.ass", "b.ass"), 0))
++        val planner = AssFeedPlanner(index)
++        val start = planner.plan(t0 + 1_000L) as AssFeedStep.Restart
++        planner.markAppended(start.link)
++        assertEquals(AssFeedStep.Drop, planner.plan(t0 + 3_600_000L))
++        assertEquals(AssFeedStep.Idle, planner.plan(t0 + 3_600_000L))
++    }
++
++    @Test
++    fun trimmedRangeForcesRestartOnSeekBack() {
++        val index = AssSegmentIndex()
++        index.ingest(playlist((0 until 40).map { "s$it.ass" }, 0))
++        val planner = AssFeedPlanner(index)
++        var now = t0 + 1_000L
++        planner.markAppended((planner.plan(now) as AssFeedStep.Restart).link)
++        for (i in 1..30) {
++            now = t0 + i * 5_000L + 1_000L
++            while (true) {
++                val step = planner.plan(now) as? AssFeedStep.Append ?: break
++                planner.markAppended(step.link)
++            }
++        }
++        planner.trimRangeStart(now - 60_000L)
++        assertTrue(planner.plan(t0 + 2_000L) is AssFeedStep.Restart)
++    }
++}
+diff --git a/app/src/test/java/kr/dcmys/komorebi/ass/AssPlaylistTest.kt b/app/src/test/java/kr/dcmys/komorebi/ass/AssPlaylistTest.kt
+new file mode 100644
+index 0000000..7c1d8d5
+--- /dev/null
++++ b/app/src/test/java/kr/dcmys/komorebi/ass/AssPlaylistTest.kt
+@@ -0,0 +1,93 @@
++package kr.dcmys.komorebi.ass
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class AssPlaylistTest {
++
++    private val base = "https://cdn.example.com/ch/arib_ass/stream.m3u8"
++
++    private val live = """
++        #EXTM3U
++        #EXT-X-VERSION:3
++        #EXT-X-TARGETDURATION:5
++        #EXT-X-MAP:URI="https://cache.example.com/abc/arib_ass/init.ass"
++        #EXT-X-MEDIA-SEQUENCE:358620286
++        #EXT-X-DISCONTINUITY-SEQUENCE:168
++        #EXTINF:5.000000,
++        #EXT-X-PROGRAM-DATE-TIME:2026-11-24T16:33:43.791+0000
++        https://cache.example.com/abc/arib_ass/20261124-163341.ass
++        #EXTINF:5.000000,
++        #EXT-X-PROGRAM-DATE-TIME:2026-11-24T16:33:48.791+0000
++        https://cache.example.com/abc/arib_ass/20261124-163346.ass
++        #EXT-X-DISCONTINUITY
++        #EXT-X-MAP:URI="https://cache.example.com/abc/arib_ass/init.ass"
++        #EXTINF:5.000000,
++        #EXT-X-PROGRAM-DATE-TIME:2026-11-24T16:33:53.791+0000
++        https://cache.example.com/abc/arib_ass/20261124-163351.ass
++    """.trimIndent()
++
++    @Test
++    fun parsesMeasuredLivePlaylist() {
++        val p = AssPlaylistParser.parse(live, base)
++        assertEquals(5_000L, p.targetDurationMs)
++        assertTrue(p.isAss)
++        assertFalse(p.endList)
++        assertEquals(3, p.segments.size)
++        val first = p.segments[0]
++        assertEquals("https://cache.example.com/abc/arib_ass/20261124-163341.ass", first.uri)
++        assertEquals(5_000L, first.durationMs)
++        assertEquals(1_795_538_023_791L, first.startMs)
++        assertEquals("https://cache.example.com/abc/arib_ass/init.ass", first.mapUri)
++        assertFalse(first.discontinuity)
++        assertFalse(p.segments[1].discontinuity)
++        assertTrue(p.segments[2].discontinuity)
++        assertEquals(first.startMs!! + 10_000L, p.segments[2].startMs)
++    }
++
++    @Test
++    fun relativeUrisResolveAgainstThePlaylist() {
++        val text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MAP:URI=\"init.ass\"\n" +
++            "#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00Z\n#EXTINF:6.0,\nseg1.ass\n" +
++            "#EXTINF:6.0,\n/root/seg2.ass?x=1\n#EXT-X-ENDLIST\n"
++        val p = AssPlaylistParser.parse(text, base)
++        assertEquals(6_000L, p.targetDurationMs)
++        assertEquals("https://cdn.example.com/ch/arib_ass/init.ass", p.segments[0].mapUri)
++        assertEquals("https://cdn.example.com/ch/arib_ass/seg1.ass", p.segments[0].uri)
++        assertEquals("https://cdn.example.com/root/seg2.ass?x=1", p.segments[1].uri)
++        assertEquals(p.segments[0].startMs!! + 6_000L, p.segments[1].startMs)
++        assertTrue(p.endList)
++        assertTrue(p.isAss)
++    }
++
++    @Test
++    fun missingLeadingPdtIsExtrapolatedBackwards() {
++        val text = "#EXTM3U\n#EXTINF:5,\na.ass\n#EXTINF:5,\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:10Z\nb.ass\n"
++        val p = AssPlaylistParser.parse(text, base)
++        assertEquals(p.segments[1].startMs!! - 5_000L, p.segments[0].startMs)
++    }
++
++    @Test
++    fun noPdtAtAllLeavesStartsUnknownAndVttIsNotAss() {
++        val text = "#EXTM3U\n#EXTINF:5,\na.vtt\n"
++        val p = AssPlaylistParser.parse(text, base)
++        assertNull(p.segments[0].startMs)
++        assertFalse(p.isAss)
++    }
++
++    @Test
++    fun programDateTimeOffsets() {
++        val utc = AssPlaylistParser.parseProgramDateTimeMs("2026-11-24T16:33:43.791Z")!!
++        assertEquals(1_795_538_023_791L, utc)
++        assertEquals(utc, AssPlaylistParser.parseProgramDateTimeMs("2026-11-24T16:33:43.791+0000"))
++        assertEquals(utc, AssPlaylistParser.parseProgramDateTimeMs("2026-11-25T01:33:43.791+09:00"))
++        assertEquals(utc, AssPlaylistParser.parseProgramDateTimeMs("2026-11-24T16:33:43.791"))
++        assertEquals(utc - 791, AssPlaylistParser.parseProgramDateTimeMs("2026-11-24T11:33:43-05"))
++        assertEquals(0L, AssPlaylistParser.parseProgramDateTimeMs("1970-01-01T00:00:00Z"))
++        assertEquals(951_782_400_000L, AssPlaylistParser.parseProgramDateTimeMs("2000-02-29T00:00:00Z"))
++        assertNull(AssPlaylistParser.parseProgramDateTimeMs("not a date"))
++    }
++}
+diff --git a/app/src/test/java/kr/dcmys/komorebi/ass/AssScriptTest.kt b/app/src/test/java/kr/dcmys/komorebi/ass/AssScriptTest.kt
+new file mode 100644
+index 0000000..47edb0e
+--- /dev/null
++++ b/app/src/test/java/kr/dcmys/komorebi/ass/AssScriptTest.kt
+@@ -0,0 +1,72 @@
++package kr.dcmys.komorebi.ass
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class AssScriptTest {
++
++    private val initAss = "[Script Info]\r\nScriptType: v4.00+\r\nPlayResX: 960\r\nPlayResY: 540\r\nWrapStyle: 2\r\n\r\n" +
++        "[V4+ Styles]\r\n" +
++        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, " +
++        "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, " +
++        "MarginR, MarginV, Encoding\r\n" +
++        "Style: Default,WadaLabChuMaruGo2004ARIB,36,&Hffffff,&Hffffff,&H80000000,&H40112233,0,0,0,0,100,100,0,0,4,0,4,2,10,10,10,0\r\n\r\n"
++
++    @Test
++    fun headerGetsEventsFormatAndOpaqueBorderColours() {
++        val h = AssScript.prepareHeader(initAss, null)
++        assertTrue(h.contains("PlayResX: 960\n"))
++        assertTrue(
++            h.contains("Style: Default,WadaLabChuMaruGo2004ARIB,36,&Hffffff,&Hffffff,&H00000000,&H00112233,0,0,0,0,100,100,0,0,4,0,4,2,10,10,10,0\n"),
++        )
++        assertTrue(h.endsWith("\n[Events]\n" + AssScript.EVENTS_FORMAT + "\n"))
++        assertFalse(h.contains("\r"))
++    }
++
++    @Test
++    fun headerFontnameIsReplacedWhenAFontIsRegistered() {
++        val h = AssScript.prepareHeader(initAss.replace("WadaLabChuMaruGo2004ARIB", "Other"), "WadaLabChuMaruGo2004ARIB")
++        assertTrue(h.contains("Style: Default,WadaLabChuMaruGo2004ARIB,36,"))
++    }
++
++    @Test
++    fun existingEventsSectionIsReplaced() {
++        val h = AssScript.prepareHeader(initAss + "[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:00.00,0:00:01.00,Default,x\n", null)
++        assertEquals(1, Regex("""\[Events]""").findAll(h).count())
++        assertFalse(h.contains("Dialogue:"))
++        assertTrue(h.endsWith(AssScript.EVENTS_FORMAT + "\n"))
++    }
++
++    @Test
++    fun opaqueColour() {
++        assertEquals("&H00000000", AssScript.opaque("&H0"))
++        assertEquals("&H00FFFFFF", AssScript.opaque("&HFFFFFFFF&"))
++        assertEquals("&H00000010", AssScript.opaque("16"))
++        assertEquals("junk", AssScript.opaque("junk"))
++    }
++
++    @Test
++    fun textStripsExactlyTheOverridesMediaFeStrips() {
++        val text = "{\\an7}{\\pos(60,449)}{\\fsp4}{\\bord3}{\\3a&Hff&}{\\1c&H00ffff&}text"
++        assertEquals("{\\an7}{\\pos(60,449)}{\\fsp4}{\\1c&H00ffff&}text", AssScript.cleanText(text))
++        assertEquals("{\\bord2}{\\3a&HFF&}x", AssScript.cleanText("{\\bord2}{\\3a&HFF&}x"))
++    }
++
++    @Test
++    fun chunkLineIsMatroskaOrder() {
++        val d = AssSegmentParser.parseDialogueLines(
++            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n" +
++                "Dialogue: 1,0:00:03.58,,Default,nm,1,2,3,fx,{\\bord3}a, b\n",
++            0,
++        ).single()
++        assertEquals("7,1,Default,nm,1,2,3,fx,a, b", AssScript.chunkLine(7, d))
++    }
++
++    @Test
++    fun wallClockMapping() {
++        assertEquals(1_000_012_345L, AssScript.playbackWallClockMs(1_000_000_000L, 12_345L, 0L))
++        assertEquals(1_000_011_845L, AssScript.playbackWallClockMs(1_000_000_000L, 12_345L, 500L))
++    }
++}
+diff --git a/app/src/test/java/kr/dcmys/komorebi/ass/AssSegmentParserTest.kt b/app/src/test/java/kr/dcmys/komorebi/ass/AssSegmentParserTest.kt
+new file mode 100644
+index 0000000..db62fc6
+--- /dev/null
++++ b/app/src/test/java/kr/dcmys/komorebi/ass/AssSegmentParserTest.kt
+@@ -0,0 +1,105 @@
++package kr.dcmys.komorebi.ass
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class AssSegmentParserTest {
++
++    private val format = "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
++
++    @Test
++    fun consecutiveSegmentsRestartAtZeroAndEmptyEndIsOpen() {
++        val seg1 = """
++            [Events]
++            $format
++            Dialogue: 0,0:00:00.00,,Default,,0,0,0,,{\an7}{\pos(170,390)}それとも今は
++            Dialogue: 0,0:00:00.00,,Default,,0,0,0,,{\an7}{\pos(190,450)}ただの傭兵稼業に逆戻りかな？》
++        """.trimIndent()
++        val seg2 = """
++            [Events]
++            $format
++            Dialogue: 0,0:00:00.00,,Default,,0,0,0,,{\an7}{\pos(100,100)}次のセリフ
++        """.trimIndent()
++
++        val s1 = AssSegmentParser.parseDialogueLines(seg1, 0)
++        val s2 = AssSegmentParser.parseDialogueLines(seg2, 22_022)
++
++        assertEquals(2, s1.size)
++        assertTrue(s1.all { it.startMs == 0L })
++        assertTrue(s1.all { it.endMs == null })
++        assertTrue(s1[0].text.contains("{\\pos(170,390)}"))
++        assertEquals("Default", s1[0].style)
++        assertEquals(0, s1[0].layer)
++        assertEquals(1, s2.size)
++        assertEquals(22_022L, s2[0].startMs)
++
++        val timeline = AssTimeline()
++        timeline.addSegment(s1)
++        timeline.addSegment(s2)
++        assertEquals(22_022L, timeline.closingTimeOf(s1[0]))
++    }
++
++    @Test
++    fun explicitEndIsRespected() {
++        val text = "[Events]\n$format\nDialogue: 0,0:00:01.00,0:00:03.50,Default,,0,0,0,,hi"
++        val e = AssSegmentParser.parseDialogueLines(text, 0).single()
++        assertEquals(1_000L, e.startMs)
++        assertEquals(3_500L, e.endMs)
++    }
++
++    @Test
++    fun fieldsAreReadByNameFromTheSegmentsOwnFormatLine() {
++        val text = """
++            [Events]
++            Format: Start, End, Layer, Style, Name, MarginL, MarginR, MarginV, Effect, Text
++            Dialogue: 0:00:01.00,0:00:02.50,5,Sub,,0,0,0,,Hello, world {\pos(1,2)}
++        """.trimIndent()
++        val r = AssSegmentParser.parseDialogueLines(text, 0).single()
++        assertEquals(1_000L, r.startMs)
++        assertEquals(2_500L, r.endMs)
++        assertEquals(5, r.layer)
++        assertEquals("Sub", r.style)
++        assertEquals("Hello, world {\\pos(1,2)}", r.text)
++    }
++
++    @Test
++    fun parseAssTime() {
++        assertEquals(22_020L, AssSegmentParser.parseAssTimeMs("0:00:22.02"))
++        assertEquals(3_661_500L, AssSegmentParser.parseAssTimeMs("1:01:01.5"))
++        assertEquals(1_650L, AssSegmentParser.parseAssTimeMs("0:00:01.65"))
++        assertNull(AssSegmentParser.parseAssTimeMs(""))
++        assertNull(AssSegmentParser.parseAssTimeMs("garbage"))
++    }
++
++    @Test
++    fun measuredServerSegment() {
++        val text = "[Events]\r\n$format\r\n" +
++            "Dialogue: 0,0:00:03.58,,Default,,0,0,0,,{\\an7}{\\pos(60,449)}{\\fsp4}{\\bord3}{\\1c&H00ffff&}text\r\n" +
++            "Dialogue: 0,0:00:03.58,,Default,,0,0,0,,\r\n"
++        val events = AssSegmentParser.parseDialogueLines(text, 1_700_000_000_000L)
++        assertEquals(2, events.size)
++        assertEquals(1_700_000_003_580L, events[0].startMs)
++        assertNull(events[0].endMs)
++        assertEquals("{\\an7}{\\pos(60,449)}{\\fsp4}{\\bord3}{\\1c&H00ffff&}text", events[0].text)
++        assertEquals("", events[1].text)
++    }
++
++    @Test
++    fun emptySegmentAndBomAndDialogueDetection() {
++        assertTrue(AssSegmentParser.parseDialogueLines("[Events]\n$format\n", 0).isEmpty())
++        assertFalse(AssSegmentParser.containsDialogue("[Events]\n$format\n"))
++        val bom = "\uFEFF[Events]\n$format\nDialogue: 0,0:00:01.00,,Default,,0,0,0,,x"
++        assertEquals(1, AssSegmentParser.parseDialogueLines(bom, 0).size)
++        assertTrue(AssSegmentParser.containsDialogue(bom))
++    }
++
++    @Test
++    fun dialogueBeforeFormatOrOutsideEventsIsIgnored() {
++        val text = "[Script Info]\nDialogue: 0,0:00:01.00,,Default,,0,0,0,,x\n[Events]\n" +
++            "Dialogue: 0,0:00:01.00,,Default,,0,0,0,,y"
++        assertTrue(AssSegmentParser.parseDialogueLines(text, 0).isEmpty())
++    }
++}
+diff --git a/app/src/test/java/kr/dcmys/komorebi/ass/AssTimelineTest.kt b/app/src/test/java/kr/dcmys/komorebi/ass/AssTimelineTest.kt
+new file mode 100644
+index 0000000..fc584d3
+--- /dev/null
++++ b/app/src/test/java/kr/dcmys/komorebi/ass/AssTimelineTest.kt
+@@ -0,0 +1,154 @@
++package kr.dcmys.komorebi.ass
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class AssTimelineTest {
++
++    private fun line(start: String, text: String, end: String = "") =
++        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n" +
++            "Dialogue: 0,$start,$end,Default,,0,0,0,,$text\n"
++
++    private fun seg(timeline: AssTimeline, startSec: Int, text: String) =
++        timeline.addSegment(AssSegmentParser.parseDialogueLines(text, startSec * 1000L))
++
++    private fun AssTimeline.byText(text: String) = resolve().single { it.dialogue.text == text }
++
++    @Test
++    fun previousCaptionEndsWhereTheNextSegmentsCaptionStarts() {
++        val t = AssTimeline()
++        seg(t, 100, line("0:00:00.00", "first"))
++        val open = t.byText("first")
++        assertTrue(open.open)
++        assertEquals(100_000L + AssTimeline.OPEN_DURATION_MS, open.endMs)
++
++        seg(t, 102, line("0:00:00.00", "second"))
++        val closed = t.byText("first")
++        assertEquals(2_000L, closed.endMs - closed.startMs)
++        assertTrue(!closed.open)
++    }
++
++    @Test
++    fun rowsSharingAStartCloseTogetherAndAClearRowIsAStart() {
++        val t = AssTimeline()
++        val two = "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n" +
++            "Dialogue: 0,0:00:01.00,,Default,,0,0,0,,a\n" +
++            "Dialogue: 0,0:00:01.00,,Default,,0,0,0,,b\n"
++        seg(t, 10, two)
++        seg(t, 15, line("0:00:00.50", "")) // clear at 15.5 s
++        assertEquals(15_500L, t.byText("a").endMs)
++        assertEquals(15_500L, t.byText("b").endMs)
++    }
++
++    @Test
++    fun lateCaptionUsesAnAlreadyKnownClearTime() {
++        val t = AssTimeline()
++        seg(t, 110, line("0:00:00.00", ""))
++        seg(t, 108, line("0:00:00.00", "late"))
++        val late = t.byText("late")
++        assertEquals(2_000L, late.endMs - late.startMs)
++    }
++
++    @Test
++    fun discontinuityResetRetainsFollowingClearTime() {
++        val t = AssTimeline()
++        seg(t, 90, line("0:00:00.00", "old program"))
++        t.resetAt(100_000L)
++        seg(t, 100, line("0:00:00.00", "new program"))
++        seg(t, 102, line("0:00:00.00", ""))
++        val events = t.resolve()
++        assertTrue(events.none { it.dialogue.text == "old program" })
++        assertEquals(102_000L, t.byText("new program").endMs)
++    }
++
++    @Test
++    fun boundaryAppendedAheadIsResetOnlyWhenPlayed() {
++        val t = AssTimeline()
++        seg(t, 90, line("0:00:00.00", "outgoing"))
++        seg(t, 100, line("0:00:00.50", "incoming"))
++        seg(t, 105, line("0:00:01.00", ""))
++        assertEquals(100_500L, t.byText("outgoing").endMs)
++        t.resetAt(100_000L)
++        assertEquals(listOf("incoming", ""), t.resolve().map { it.dialogue.text }) // "" = clear row
++        assertEquals(106_000L, t.byText("incoming").endMs)
++    }
++
++    @Test
++    fun resetKeepsBoundariesAtOrAfterTheProgramStart() {
++        val t = AssTimeline()
++        seg(t, 102, line("0:00:00.00", "")) // clear known before the boundary segment arrives
++        t.resetAt(100_000L)
++        seg(t, 100, line("0:00:00.00", "x"))
++        assertEquals(102_000L, t.byText("x").endMs)
++    }
++
++    @Test
++    fun afterAClearThePastCaptionEndsAtTheNextPastCaption() {
++        val t = AssTimeline()
++        seg(t, 600, line("0:00:01.00", "live"))
++        t.clear()
++        assertTrue(t.resolve().isEmpty())
++        seg(t, 300, line("0:00:04.00", "past A"))
++        seg(t, 306, line("0:00:01.00", "past B"))
++        val a = t.byText("past A")
++        assertEquals(3_000L, a.endMs - a.startMs)
++        assertEquals(listOf("past A", "past B"), t.resolve().map { it.dialogue.text })
++    }
++
++    @Test
++    fun explicitEndIsKept() {
++        val t = AssTimeline()
++        seg(t, 0, line("0:00:01.00", "x", end = "0:00:02.00"))
++        seg(t, 0, line("0:00:05.00", "y"))
++        assertEquals(2_000L, t.byText("x").endMs)
++    }
++
++    @Test
++    fun pruneDropsFinishedEventsButKeepsCaptionStillOnScreen() {
++        val t = AssTimeline()
++        seg(t, 0, line("0:00:00.00", "gone"))
++        seg(t, 10, line("0:00:00.00", "showing"))
++        seg(t, 100, line("0:00:00.00", "next"))
++        val before = t.version
++        t.prune(50_000L)
++        assertEquals(listOf("showing", "next"), t.resolve().map { it.dialogue.text })
++        assertEquals(100_000L, t.byText("showing").endMs)
++        assertTrue(t.version != before)
++    }
++
++    @Test
++    fun versionMovesOnlyOnChange() {
++        val t = AssTimeline()
++        val v0 = t.version
++        t.addSegment(emptyList())
++        t.clear()
++        assertEquals(v0, t.version)
++        seg(t, 0, line("0:00:00.00", "x"))
++        assertTrue(t.version > v0)
++    }
++
++    @Test
++    fun scheduleChangesOnlyAtEventBoundaries() {
++        val t = AssTimeline()
++        seg(t, 10, line("0:00:00.00", "a"))
++        seg(t, 20, line("0:00:00.00", "b"))
++        val s = AssRenderSchedule(t.resolve())
++        assertEquals(Long.MIN_VALUE, s.stableFrom(5_000L))
++        assertEquals(10_000L, s.stableUntil(5_000L))
++        assertEquals(10_000L, s.stableFrom(15_000L))
++        assertEquals(20_000L, s.stableUntil(15_000L))
++        assertEquals(20_000L, s.stableFrom(20_000L))
++        assertEquals(20_000L + AssTimeline.OPEN_DURATION_MS, s.stableUntil(20_000L))
++    }
++
++    @Test
++    fun animatedEventRequestsEveryFrame() {
++        val t = AssTimeline()
++        seg(t, 10, line("0:00:00.00", "{\\fad(200,200)}a", end = "0:00:03.00"))
++        val s = AssRenderSchedule(t.resolve())
++        assertEquals(11_001L, s.stableUntil(11_000L))
++        assertEquals(10_000L, s.stableUntil(9_000L))
++        assertTrue(!AssRenderSchedule.isAnimated("{\\an7}{\\pos(60,449)}{\\fsp4}{\\fscx50}{\\fs36}x"))
++    }
++}
+diff --git a/app/src/test/java/kr/dcmys/komorebi/ass/VideoRectTest.kt b/app/src/test/java/kr/dcmys/komorebi/ass/VideoRectTest.kt
+new file mode 100644
+index 0000000..30c8b09
+--- /dev/null
++++ b/app/src/test/java/kr/dcmys/komorebi/ass/VideoRectTest.kt
+@@ -0,0 +1,36 @@
++package kr.dcmys.komorebi.ass
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class VideoRectTest {
++
++    @Test
++    fun unknownVideoSizeCoversTheView() {
++        assertEquals(1920 to 1080, fitVideoRect(1920, 1080, 0, 0, 1f))
++    }
++
++    @Test
++    fun wideVideoFills() {
++        assertEquals(1920 to 1080, fitVideoRect(1920, 1080, 1920, 1080, 1f))
++        // 1440x1080 with square pixels is treated as anamorphic 16:9 and stretched.
++        assertEquals(1920 to 1080, fitVideoRect(1920, 1080, 1440, 1080, 1f))
++        // A 2.35:1 picture is stretched too (FILL from 1.7 up).
++        assertEquals(1280 to 1080, fitVideoRect(1280, 1080, 2350, 1000, 1f))
++    }
++
++    @Test
++    fun anamorphicWithPixelRatioWithinToleranceCovers() {
++        assertEquals(1920 to 1080, fitVideoRect(1920, 1080, 1440, 1080, 4f / 3f))
++    }
++
++    @Test
++    fun fourByThreeIsPillarboxed() {
++        assertEquals(1440 to 1080, fitVideoRect(1920, 1080, 720, 540, 1f))
++    }
++
++    @Test
++    fun tallViewLetterboxes() {
++        assertEquals(1440 to 960, fitVideoRect(1440, 1080, 720, 480, 1f))
++    }
++}
