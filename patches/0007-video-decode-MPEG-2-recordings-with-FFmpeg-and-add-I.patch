@@ -1,0 +1,4420 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yoonji Park <koreapyj@dcmys.kr>
+Date: Fri, 27 Nov 2026 08:51:10 +0900
+Subject: [PATCH] video: decode MPEG-2 recordings with FFmpeg and add
+ IVTC/deinterlace filters
+
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 9a4874f..5896a3c 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -57,6 +57,9 @@
+                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+             </intent-filter>
+         </activity>
++        <uses-native-library
++            android:name="libOpenCL.so"
++            android:required="false" />
+     </application>
+ 
+ </manifest>
+diff --git a/app/src/main/cpp/CMakeLists.txt b/app/src/main/cpp/CMakeLists.txt
+index 12cfc1d..f600e4a 100644
+--- a/app/src/main/cpp/CMakeLists.txt
++++ b/app/src/main/cpp/CMakeLists.txt
+@@ -43,3 +43,5 @@ target_link_libraries(
+ 
+ # インクルードディレクトリの設定（カレントディレクトリを参照）
+ target_include_directories(komorebi-native PRIVATE .)
++
++add_subdirectory(komorebi-video)
+diff --git a/app/src/main/cpp/komorebi-video/CMakeLists.txt b/app/src/main/cpp/komorebi-video/CMakeLists.txt
+new file mode 100644
+index 0000000..918e0b3
+--- /dev/null
++++ b/app/src/main/cpp/komorebi-video/CMakeLists.txt
+@@ -0,0 +1,35 @@
++set(KOMOREBI_FFMPEG_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../third_party/ffmpeg/${ANDROID_ABI}/include")
++set(KOMOREBI_FFMPEG_LIB_DIR "${CMAKE_CURRENT_LIST_DIR}/../../jniLibs/${ANDROID_ABI}")
++set(KOMOREBI_FFMPEG_LIBS avcodec avfilter avutil swscale)
++
++if(NOT EXISTS "${KOMOREBI_FFMPEG_INCLUDE_DIR}/libavcodec/avcodec.h")
++    message(FATAL_ERROR "komorebi-video: FFmpeg headers not found at ${KOMOREBI_FFMPEG_INCLUDE_DIR}")
++endif()
++foreach(lib IN LISTS KOMOREBI_FFMPEG_LIBS)
++    if(NOT EXISTS "${KOMOREBI_FFMPEG_LIB_DIR}/lib${lib}.so")
++        message(FATAL_ERROR "komorebi-video: lib${lib}.so not found in ${KOMOREBI_FFMPEG_LIB_DIR}")
++    endif()
++    add_library(komorebi-ffmpeg-${lib} SHARED IMPORTED)
++    set_target_properties(komorebi-ffmpeg-${lib} PROPERTIES
++        IMPORTED_LOCATION "${KOMOREBI_FFMPEG_LIB_DIR}/lib${lib}.so")
++endforeach()
++
++add_library(komorebi-video SHARED
++    common/MediaQueues.cpp
++    video/FilterGraph.cpp
++    video/VideoDecoder.cpp
++    jni/SurfaceOutput.cpp
++    jni/VideoJni.cpp)
++
++target_include_directories(komorebi-video PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}"
++    "${KOMOREBI_FFMPEG_INCLUDE_DIR}")
++target_compile_features(komorebi-video PRIVATE cxx_std_17)
++# Frame copies run per displayed frame; keep them optimized in debug builds too.
++target_compile_options(komorebi-video PRIVATE -O2 -Wall -Wextra)
++
++find_library(komorebi-video-log log)
++find_library(komorebi-video-android android)
++target_link_libraries(komorebi-video PRIVATE
++    komorebi-ffmpeg-avfilter komorebi-ffmpeg-swscale komorebi-ffmpeg-avcodec komorebi-ffmpeg-avutil
++    ${komorebi-video-android} ${komorebi-video-log} dl)
+diff --git a/app/src/main/cpp/komorebi-video/common/MediaQueues.cpp b/app/src/main/cpp/komorebi-video/common/MediaQueues.cpp
+new file mode 100644
+index 0000000..8a4a76f
+--- /dev/null
++++ b/app/src/main/cpp/komorebi-video/common/MediaQueues.cpp
+@@ -0,0 +1,303 @@
++#include "common/MediaQueues.h"
++
++#include <utility>
++
++namespace aribplayer {
++
++PacketItem::~PacketItem() {
++    av_packet_free(&packet);
++}
++
++PacketItem::PacketItem(PacketItem&& other) noexcept
++    : packet(other.packet), serial(other.serial), end_of_stream(other.end_of_stream) {
++    other.packet = nullptr;
++}
++
++PacketItem& PacketItem::operator=(PacketItem&& other) noexcept {
++    if (this != &other) {
++        av_packet_free(&packet);
++        packet = other.packet;
++        serial = other.serial;
++        end_of_stream = other.end_of_stream;
++        other.packet = nullptr;
++    }
++    return *this;
++}
++
++PacketQueue::PacketQueue(std::size_t max_packets, std::size_t max_bytes)
++    : max_packets_(max_packets), max_bytes_(max_bytes) {}
++
++PacketQueue::~PacketQueue() {
++    Abort();
++    Flush();
++}
++
++QueueResult PacketQueue::Put(const AVPacket& packet, int serial, bool block) {
++    AVPacket* copy = av_packet_alloc();
++    if (copy == nullptr || av_packet_ref(copy, &packet) < 0) {
++        av_packet_free(&copy);
++        return QueueResult::kFull;
++    }
++
++    PacketItem item;
++    item.packet = copy;
++    item.serial = serial;
++    return Enqueue(std::move(item), static_cast<std::size_t>(packet.size), block);
++}
++
++QueueResult PacketQueue::PutEof(int serial, bool block) {
++    PacketItem item;
++    item.serial = serial;
++    item.end_of_stream = true;
++    return Enqueue(std::move(item), 0, block);
++}
++
++QueueResult PacketQueue::Enqueue(PacketItem&& item, std::size_t bytes, bool block) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    const auto has_room = [this, bytes] {
++        return packets_.size() < max_packets_ && bytes_ + bytes <= max_bytes_;
++    };
++    if (block) {
++        not_full_.wait(lock, [this, &has_room] { return aborted_ || has_room(); });
++    }
++    if (aborted_) {
++        return QueueResult::kAborted;
++    }
++    if (!has_room()) {
++        return QueueResult::kFull;
++    }
++
++    bytes_ += bytes;
++    packets_.emplace_back(std::move(item));
++    lock.unlock();
++    not_empty_.notify_one();
++    return QueueResult::kOk;
++}
++
++QueueResult PacketQueue::Get(PacketItem* item, bool block) {
++    if (item == nullptr) {
++        return QueueResult::kAborted;
++    }
++    std::unique_lock<std::mutex> lock(mutex_);
++    if (block) {
++        not_empty_.wait(lock, [this] {
++            return aborted_ || flush_pending_ || !packets_.empty();
++        });
++    }
++    if (aborted_) {
++        return QueueResult::kAborted;
++    }
++    if (flush_pending_) {
++        flush_pending_ = false;
++        return QueueResult::kFlushed;
++    }
++    if (packets_.empty()) {
++        return QueueResult::kFull;
++    }
++
++    bytes_ -= static_cast<std::size_t>(packets_.front().packet == nullptr
++                                           ? 0
++                                           : packets_.front().packet->size);
++    *item = std::move(packets_.front());
++    packets_.pop_front();
++    lock.unlock();
++    not_full_.notify_one();
++    return QueueResult::kOk;
++}
++
++void PacketQueue::Flush() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    packets_.clear();
++    bytes_ = 0;
++    flush_pending_ = true;
++    not_empty_.notify_all();
++    not_full_.notify_all();
++}
++
++void PacketQueue::Abort() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    aborted_ = true;
++    not_empty_.notify_all();
++    not_full_.notify_all();
++}
++
++void PacketQueue::Reset() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    packets_.clear();
++    bytes_ = 0;
++    aborted_ = false;
++    flush_pending_ = false;
++    not_full_.notify_all();
++}
++
++std::size_t PacketQueue::Size() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return packets_.size();
++}
++
++FrameItem::~FrameItem() {
++    Release();
++}
++
++FrameItem::FrameItem(FrameItem&& other) noexcept
++    : frame(other.frame), serial(other.serial), pts_seconds(other.pts_seconds),
++      end_of_stream(other.end_of_stream), return_to(other.return_to) {
++    other.frame = nullptr;
++}
++
++FrameItem& FrameItem::operator=(FrameItem&& other) noexcept {
++    if (this != &other) {
++        Release();
++        frame = other.frame;
++        serial = other.serial;
++        pts_seconds = other.pts_seconds;
++        end_of_stream = other.end_of_stream;
++        return_to = other.return_to;
++        other.frame = nullptr;
++    }
++    return *this;
++}
++
++void FrameItem::Release() {
++    if (return_to != nullptr) {
++        return_to->Return(&frame);
++    } else {
++        av_frame_free(&frame);
++    }
++}
++
++FrameQueue::FrameQueue(std::size_t capacity) : capacity_(capacity) {}
++
++FrameQueue::~FrameQueue() {
++    Abort();
++    Flush();
++}
++
++QueueResult FrameQueue::WaitForRoom(std::unique_lock<std::mutex>& lock, bool block) {
++    while (true) {
++        if (!returned_.empty()) {
++            std::vector<FrameItem> released;
++            released.swap(returned_);
++            lock.unlock();
++            released.clear();
++            lock.lock();
++            continue;
++        }
++        if (aborted_) return QueueResult::kAborted;
++        if (frames_.size() < capacity_) return QueueResult::kOk;
++        if (!block) return QueueResult::kFull;
++        not_full_.wait(lock);
++    }
++}
++
++QueueResult FrameQueue::Push(const AVFrame& frame, int serial, double pts_seconds,
++                             bool block) {
++    AVFrame* copy = av_frame_alloc();
++    if (copy == nullptr || av_frame_ref(copy, &frame) < 0) {
++        av_frame_free(&copy);
++        return QueueResult::kFull;
++    }
++
++    std::unique_lock<std::mutex> lock(mutex_);
++    const QueueResult room = WaitForRoom(lock, block);
++    if (room != QueueResult::kOk) {
++        av_frame_free(&copy);
++        return room;
++    }
++
++    FrameItem item;
++    item.frame = copy;
++    item.serial = serial;
++    item.pts_seconds = pts_seconds;
++    frames_.emplace_back(std::move(item));
++    lock.unlock();
++    not_empty_.notify_one();
++    return QueueResult::kOk;
++}
++
++QueueResult FrameQueue::PushEof(int serial, bool block) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    const QueueResult room = WaitForRoom(lock, block);
++    if (room != QueueResult::kOk) return room;
++
++    FrameItem item;
++    item.serial = serial;
++    item.end_of_stream = true;
++    frames_.emplace_back(std::move(item));
++    lock.unlock();
++    not_empty_.notify_one();
++    return QueueResult::kOk;
++}
++
++QueueResult FrameQueue::Pop(FrameItem* item, bool block) {
++    if (item == nullptr) {
++        return QueueResult::kAborted;
++    }
++    *item = FrameItem();
++    std::unique_lock<std::mutex> lock(mutex_);
++    if (block) {
++        not_empty_.wait(lock, [this] { return aborted_ || !frames_.empty(); });
++    }
++    if (aborted_) {
++        return QueueResult::kAborted;
++    }
++    if (frames_.empty()) {
++        return QueueResult::kFull;
++    }
++
++    *item = std::move(frames_.front());
++    item->return_to = this;
++    frames_.pop_front();
++    lock.unlock();
++    not_full_.notify_one();
++    return QueueResult::kOk;
++}
++
++void FrameQueue::Return(AVFrame** frame) {
++    if (frame == nullptr || *frame == nullptr) return;
++    FrameItem item;
++    item.frame = *frame;
++    *frame = nullptr;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        returned_.emplace_back(std::move(item));
++    }
++    not_full_.notify_one();
++}
++
++void FrameQueue::ReleaseReturned() {
++    std::vector<FrameItem> released;
++    std::lock_guard<std::mutex> lock(mutex_);
++    released.swap(returned_);
++}
++
++void FrameQueue::Flush() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    for (FrameItem& item : frames_) {
++        if (item.frame != nullptr) returned_.emplace_back(std::move(item));
++    }
++    frames_.clear();
++    not_full_.notify_all();
++}
++
++void FrameQueue::Abort() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    aborted_ = true;
++    not_empty_.notify_all();
++    not_full_.notify_all();
++}
++
++void FrameQueue::Reset() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    frames_.clear();
++    returned_.clear();
++    aborted_ = false;
++    not_full_.notify_all();
++}
++
++std::size_t FrameQueue::Size() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return frames_.size();
++}
++
++}  // namespace aribplayer
+diff --git a/app/src/main/cpp/komorebi-video/common/MediaQueues.h b/app/src/main/cpp/komorebi-video/common/MediaQueues.h
+new file mode 100644
+index 0000000..60ed863
+--- /dev/null
++++ b/app/src/main/cpp/komorebi-video/common/MediaQueues.h
+@@ -0,0 +1,128 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <vector>
++
++extern "C" {
++#include <libavcodec/packet.h>
++#include <libavutil/frame.h>
++}
++
++namespace aribplayer {
++
++enum class QueueResult {
++    kOk,
++    kAborted,
++    kFlushed,
++    kFull,
++};
++
++// Owns one AVPacket reference and annotates it with the seek generation that
++// produced it. A decoder must discard buffered codec state when serial changes.
++struct PacketItem {
++    AVPacket* packet = nullptr;
++    int serial = 0;
++    bool end_of_stream = false;
++
++    PacketItem() = default;
++    ~PacketItem();
++    PacketItem(PacketItem&& other) noexcept;
++    PacketItem& operator=(PacketItem&& other) noexcept;
++    PacketItem(const PacketItem&) = delete;
++    PacketItem& operator=(const PacketItem&) = delete;
++};
++
++class PacketQueue {
++public:
++    explicit PacketQueue(std::size_t max_packets = 64,
++                         std::size_t max_bytes = 4U * 1024U * 1024U);
++    ~PacketQueue();
++
++    // Creates an owned packet reference. Blocks for bounded backpressure when
++    // requested; returns kFull immediately when block is false.
++    QueueResult Put(const AVPacket& packet, int serial, bool block = true);
++    QueueResult PutEof(int serial, bool block = true);
++    QueueResult Get(PacketItem* item, bool block = true);
++
++    void Flush();
++    void Abort();
++    void Reset();
++    std::size_t Size() const;
++
++private:
++    QueueResult Enqueue(PacketItem&& item, std::size_t bytes, bool block);
++
++    const std::size_t max_packets_;
++    const std::size_t max_bytes_;
++    mutable std::mutex mutex_;
++    std::condition_variable not_empty_;
++    std::condition_variable not_full_;
++    std::deque<PacketItem> packets_;
++    std::size_t bytes_ = 0;
++    bool aborted_ = false;
++    bool flush_pending_ = false;
++};
++
++class FrameQueue;
++
++// Owns one AVFrame reference and its presentation timestamp in seconds. A
++// popped item hands its reference back to the queue instead of freeing it.
++struct FrameItem {
++    AVFrame* frame = nullptr;
++    int serial = 0;
++    double pts_seconds = 0.0;
++    bool end_of_stream = false;
++    FrameQueue* return_to = nullptr;
++
++    FrameItem() = default;
++    ~FrameItem();
++    FrameItem(FrameItem&& other) noexcept;
++    FrameItem& operator=(FrameItem&& other) noexcept;
++    FrameItem(const FrameItem&) = delete;
++    FrameItem& operator=(const FrameItem&) = delete;
++
++private:
++    void Release();
++};
++
++class FrameQueue {
++public:
++    // Four frames provides a small renderer handoff window without allowing
++    // video decoding to run arbitrarily ahead of playback.
++    explicit FrameQueue(std::size_t capacity = 4);
++    ~FrameQueue();
++
++    // Push, PushEof and ReleaseReturned belong to the single producer thread,
++    // which frees returned frames.
++    QueueResult Push(const AVFrame& frame, int serial, double pts_seconds,
++                     bool block = true);
++    QueueResult PushEof(int serial, bool block = true);
++    QueueResult Pop(FrameItem* item, bool block = true);
++
++    // Freeing a mapped OpenCL frame waits for the producer's queued GPU work,
++    // so consumers hand frames back instead of freeing them.
++    void Return(AVFrame** frame);
++    void ReleaseReturned();
++
++    void Flush();
++    void Abort();
++    void Reset();
++    std::size_t Size() const;
++
++private:
++    QueueResult WaitForRoom(std::unique_lock<std::mutex>& lock, bool block);
++
++    const std::size_t capacity_;
++    mutable std::mutex mutex_;
++    std::condition_variable not_empty_;
++    std::condition_variable not_full_;
++    std::deque<FrameItem> frames_;
++    std::vector<FrameItem> returned_;
++    bool aborted_ = false;
++};
++
++}  // namespace aribplayer
+diff --git a/app/src/main/cpp/komorebi-video/jni/SurfaceOutput.cpp b/app/src/main/cpp/komorebi-video/jni/SurfaceOutput.cpp
+new file mode 100644
+index 0000000..279b8b0
+--- /dev/null
++++ b/app/src/main/cpp/komorebi-video/jni/SurfaceOutput.cpp
+@@ -0,0 +1,189 @@
++#include "jni/SurfaceOutput.h"
++
++#include <android/native_window_jni.h>
++#include <dlfcn.h>
++
++#include <algorithm>
++#include <cstring>
++
++extern "C" {
++#include <libavutil/pixfmt.h>
++}
++
++namespace komorebi {
++namespace {
++
++constexpr int32_t kHalPixelFormatYv12 = 0x32315659;
++constexpr int32_t kDataspaceBt601_625 = 281149440;
++constexpr int32_t kDataspaceBt601_525 = 281280512;
++constexpr int32_t kDataspaceBt709 = 281083904;
++
++using SetDataSpaceFn = int32_t (*)(ANativeWindow*, int32_t);
++
++int32_t DataspaceFor(const AVFrame& frame) {
++    switch (frame.colorspace) {
++        case AVCOL_SPC_BT470BG: return kDataspaceBt601_625;
++        case AVCOL_SPC_SMPTE170M: return kDataspaceBt601_525;
++        case AVCOL_SPC_BT709: return kDataspaceBt709;
++        default: return frame.height < 720 ? kDataspaceBt601_525 : kDataspaceBt709;
++    }
++}
++
++void CopyPlane(uint8_t* destination, int destination_stride, const uint8_t* source,
++               int source_stride, int width, int height) {
++    for (int y = 0; y < height; ++y) {
++        std::memcpy(destination + static_cast<size_t>(y) * destination_stride,
++                    source + static_cast<size_t>(y) * source_stride, width);
++    }
++}
++
++void GiveBack(AVFrame** frame, aribplayer::FrameQueue* owner) {
++    if (owner != nullptr) {
++        owner->Return(frame);
++    } else {
++        av_frame_free(frame);
++    }
++}
++
++}  // namespace
++
++SurfaceOutput::SurfaceOutput() : thread_(&SurfaceOutput::Loop, this) {}
++
++SurfaceOutput::~SurfaceOutput() {
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        stop_ = true;
++    }
++    wake_.notify_all();
++    thread_.join();
++    GiveBack(&pending_, pending_owner_);
++    if (pending_window_ != nullptr) ANativeWindow_release(pending_window_);
++}
++
++bool SurfaceOutput::Submit(JNIEnv* env, jobject surface, const AVFrame& frame,
++                           aribplayer::FrameQueue* owner) {
++    if (window_ == nullptr || !env->IsSameObject(surface_, surface)) {
++        Detach(env);
++        window_ = ANativeWindow_fromSurface(env, surface);
++        if (window_ == nullptr) return false;
++        surface_ = env->NewGlobalRef(surface);
++    }
++    AVFrame* copy = av_frame_clone(&frame);
++    if (copy == nullptr) return false;
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (pending_ != nullptr) {
++            GiveBack(&pending_, pending_owner_);
++            ANativeWindow_release(pending_window_);
++        }
++        pending_ = copy;
++        pending_owner_ = owner;
++        pending_window_ = window_;
++        ANativeWindow_acquire(pending_window_);
++    }
++    wake_.notify_one();
++    return true;
++}
++
++void SurfaceOutput::Drain() {
++    std::unique_lock<std::mutex> lock(mutex_);
++    GiveBack(&pending_, pending_owner_);
++    pending_owner_ = nullptr;
++    if (pending_window_ != nullptr) ANativeWindow_release(pending_window_);
++    pending_window_ = nullptr;
++    idle_.wait(lock, [this] { return !busy_; });
++}
++
++void SurfaceOutput::Detach(JNIEnv* env) {
++    Drain();
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        geometry_window_ = nullptr;
++        width_ = 0;
++        height_ = 0;
++        dataspace_ = 0;
++    }
++    if (window_ != nullptr) ANativeWindow_release(window_);
++    window_ = nullptr;
++    if (surface_ != nullptr) env->DeleteGlobalRef(surface_);
++    surface_ = nullptr;
++}
++
++void SurfaceOutput::Loop() {
++    std::unique_lock<std::mutex> lock(mutex_);
++    while (true) {
++        wake_.wait(lock, [this] { return stop_ || pending_ != nullptr; });
++        if (stop_) return;
++        AVFrame* frame = pending_;
++        aribplayer::FrameQueue* owner = pending_owner_;
++        ANativeWindow* window = pending_window_;
++        pending_ = nullptr;
++        pending_owner_ = nullptr;
++        pending_window_ = nullptr;
++        busy_ = true;
++        lock.unlock();
++        Post(window, *frame);
++        GiveBack(&frame, owner);
++        ANativeWindow_release(window);
++        lock.lock();
++        busy_ = false;
++        idle_.notify_all();
++    }
++}
++
++bool SurfaceOutput::Post(ANativeWindow* window, const AVFrame& frame) {
++    if (window != geometry_window_ || frame.width != width_ || frame.height != height_) {
++        if (ANativeWindow_setBuffersGeometry(window, frame.width, frame.height,
++                                             kHalPixelFormatYv12) != 0) {
++            return false;
++        }
++        geometry_window_ = window;
++        width_ = frame.width;
++        height_ = frame.height;
++        dataspace_ = 0;
++    }
++    const int32_t dataspace = DataspaceFor(frame);
++    if (dataspace != dataspace_) {
++        static const auto set_dataspace = reinterpret_cast<SetDataSpaceFn>(
++                dlsym(RTLD_DEFAULT, "ANativeWindow_setBuffersDataSpace"));
++        if (set_dataspace != nullptr) set_dataspace(window, dataspace);
++        dataspace_ = dataspace;
++    }
++
++    ANativeWindow_Buffer buffer{};
++    if (ANativeWindow_lock(window, &buffer, nullptr) != 0) return false;
++    if (buffer.bits == nullptr) {
++        ANativeWindow_unlockAndPost(window);
++        return false;
++    }
++    const int width = std::min(frame.width, buffer.width);
++    const int height = std::min(frame.height, buffer.height);
++    const int chroma_width = (width + 1) / 2;
++    const int chroma_height = (height + 1) / 2;
++    const int buffer_chroma_height = (buffer.height + 1) / 2;
++    const int chroma_stride = ((buffer.stride / 2) + 15) & ~15;
++    auto* y_plane = static_cast<uint8_t*>(buffer.bits);
++    uint8_t* v_plane = y_plane + static_cast<size_t>(buffer.stride) * buffer.height;
++    uint8_t* u_plane = v_plane + static_cast<size_t>(chroma_stride) * buffer_chroma_height;
++
++    CopyPlane(y_plane, buffer.stride, frame.data[0], frame.linesize[0], width, height);
++    if (frame.format == AV_PIX_FMT_NV12) {
++        for (int y = 0; y < chroma_height; ++y) {
++            const uint8_t* source = frame.data[1] + static_cast<size_t>(y) * frame.linesize[1];
++            uint8_t* u = u_plane + static_cast<size_t>(y) * chroma_stride;
++            uint8_t* v = v_plane + static_cast<size_t>(y) * chroma_stride;
++            for (int x = 0; x < chroma_width; ++x) {
++                u[x] = source[2 * x];
++                v[x] = source[2 * x + 1];
++            }
++        }
++    } else {
++        CopyPlane(u_plane, chroma_stride, frame.data[1], frame.linesize[1],
++                  chroma_width, chroma_height);
++        CopyPlane(v_plane, chroma_stride, frame.data[2], frame.linesize[2],
++                  chroma_width, chroma_height);
++    }
++    return ANativeWindow_unlockAndPost(window) == 0;
++}
++
++}  // namespace komorebi
+diff --git a/app/src/main/cpp/komorebi-video/jni/SurfaceOutput.h b/app/src/main/cpp/komorebi-video/jni/SurfaceOutput.h
+new file mode 100644
+index 0000000..aef6162
+--- /dev/null
++++ b/app/src/main/cpp/komorebi-video/jni/SurfaceOutput.h
+@@ -0,0 +1,67 @@
++#pragma once
++
++#include <android/native_window.h>
++#include <jni.h>
++
++#include <condition_variable>
++#include <cstdint>
++#include <mutex>
++#include <thread>
++
++#include "common/MediaQueues.h"
++
++extern "C" {
++#include <libavutil/frame.h>
++}
++
++namespace komorebi {
++
++// Posts decoded frames to an ANativeWindow as YV12 on its own thread.
++// ANativeWindow_lock blocks until the display releases a buffer (about one
++// vsync once the queue is full), which must not stall media3's playback thread.
++// Holds at most one pending frame; a newer frame replaces an unposted one.
++class SurfaceOutput final {
++public:
++    SurfaceOutput();
++    ~SurfaceOutput();
++
++    SurfaceOutput(const SurfaceOutput&) = delete;
++    SurfaceOutput& operator=(const SurfaceOutput&) = delete;
++
++    // Caller thread (media3 playback thread). Takes a new reference to frame and
++    // hands it back to owner when done: freeing a mapped OpenCL frame waits for
++    // the filter thread's GPU work.
++    bool Submit(JNIEnv* env, jobject surface, const AVFrame& frame,
++                aribplayer::FrameQueue* owner);
++    // Returns any pending frame and waits until the render thread is idle;
++    // call before owner goes away.
++    void Drain();
++    // Drain() and drop the window.
++    void Detach(JNIEnv* env);
++
++private:
++    void Loop();
++    bool Post(ANativeWindow* window, const AVFrame& frame);
++
++    std::mutex mutex_;
++    std::condition_variable wake_;
++    std::condition_variable idle_;
++    std::thread thread_;
++    bool stop_ = false;
++    bool busy_ = false;
++    AVFrame* pending_ = nullptr;
++    aribplayer::FrameQueue* pending_owner_ = nullptr;
++    ANativeWindow* pending_window_ = nullptr;
++
++    // Caller-thread state.
++    jobject surface_ = nullptr;
++    ANativeWindow* window_ = nullptr;
++
++    // Render-thread state.
++    ANativeWindow* geometry_window_ = nullptr;
++    int width_ = 0;
++    int height_ = 0;
++    int32_t dataspace_ = 0;
++};
++
++}  // namespace komorebi
+diff --git a/app/src/main/cpp/komorebi-video/jni/VideoJni.cpp b/app/src/main/cpp/komorebi-video/jni/VideoJni.cpp
+new file mode 100644
+index 0000000..7bccf75
+--- /dev/null
++++ b/app/src/main/cpp/komorebi-video/jni/VideoJni.cpp
+@@ -0,0 +1,444 @@
++#include <android/log.h>
++#include <jni.h>
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdarg>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <string>
++
++#include "common/MediaQueues.h"
++#include "jni/SurfaceOutput.h"
++#include "video/VideoDecoder.h"
++
++extern "C" {
++#include <libavcodec/avcodec.h>
++#include <libavcodec/jni.h>
++#include <libavutil/error.h>
++#include <libavutil/log.h>
++#include <libavutil/rational.h>
++}
++
++namespace {
++
++using aribplayer::FrameItem;
++using aribplayer::FrameQueue;
++using aribplayer::PacketQueue;
++using aribplayer::QueueResult;
++using aribplayer::VideoDecoder;
++using aribplayer::VideoMode;
++
++constexpr char kTag[] = "komorebi-video";
++constexpr int kAutoVideoMode = 1;
++constexpr AVRational kMicroseconds{1, 1000000};
++
++constexpr int kQueueOk = 0;
++constexpr int kQueueFull = 1;
++constexpr int kQueueError = -1;
++
++constexpr int kDequeueNone = 0;
++constexpr int kDequeueFrame = 1;
++constexpr int kDequeueEndOfStream = 2;
++
++std::string AvError(int error) {
++    char text[AV_ERROR_MAX_STRING_SIZE]{};
++    av_strerror(error, text, sizeof(text));
++    return text;
++}
++
++const char* FieldOrderName(AVFieldOrder field_order) {
++    switch (field_order) {
++        case AV_FIELD_TT: return "TT";
++        case AV_FIELD_BB: return "BB";
++        case AV_FIELD_TB: return "TB";
++        case AV_FIELD_BT: return "BT";
++        case AV_FIELD_PROGRESSIVE: return "progressive";
++        case AV_FIELD_UNKNOWN: return "unknown";
++        default: return "other";
++    }
++}
++
++int ResolveAutoVideoMode(AVFieldOrder field_order) {
++    switch (field_order) {
++        case AV_FIELD_PROGRESSIVE:
++            return static_cast<int>(VideoMode::kOff);
++        case AV_FIELD_TT:
++        case AV_FIELD_BB:
++        case AV_FIELD_TB:
++        case AV_FIELD_BT:
++        case AV_FIELD_UNKNOWN:
++        default:
++            // Broadcast TS is predominantly interlaced; unknown is conservative.
++            return static_cast<int>(VideoMode::kDeinterlace);
++    }
++}
++
++const char* VideoModeName(int mode) {
++    switch (mode) {
++        case static_cast<int>(VideoMode::kOff): return "off";
++        case static_cast<int>(VideoMode::kIvtc): return "ivtc";
++        case static_cast<int>(VideoMode::kDeinterlace): return "deinterlace";
++        default: return "unknown";
++    }
++}
++
++bool IsRenderableFormat(int format) {
++    return format == AV_PIX_FMT_NV12 || format == AV_PIX_FMT_YUV420P ||
++           format == AV_PIX_FMT_YUVJ420P;
++}
++
++AVCodecContext* OpenCodec(const AVCodecParameters* parameters, AVRational time_base,
++                          const AVCodec* codec, std::string* error) {
++    AVCodecContext* context = avcodec_alloc_context3(codec);
++    if (context == nullptr) {
++        if (error) *error = "Unable to allocate decoder context";
++        return nullptr;
++    }
++    int result = avcodec_parameters_to_context(context, parameters);
++    if (result >= 0) {
++        context->pkt_timebase = time_base;
++        result = avcodec_open2(context, codec, nullptr);
++    }
++    if (result < 0) {
++        if (error) *error = "Unable to open " + std::string(codec->name) + ": " + AvError(result);
++        avcodec_free_context(&context);
++        return nullptr;
++    }
++    return context;
++}
++
++AVCodecContext* OpenDecoder(const AVCodecParameters* parameters, AVRational time_base,
++                            bool prefer_media_codec, bool* is_hardware, std::string* error) {
++    if (is_hardware) *is_hardware = false;
++    if (prefer_media_codec) {
++        if (const AVCodec* hardware = avcodec_find_decoder_by_name("mpeg2_mediacodec")) {
++            std::string hardware_error;
++            if (AVCodecContext* context = OpenCodec(parameters, time_base, hardware,
++                                                    &hardware_error)) {
++                if (is_hardware) *is_hardware = true;
++                return context;
++            }
++            __android_log_print(ANDROID_LOG_INFO, kTag, "%s; using software decoder",
++                                hardware_error.c_str());
++        }
++    }
++    const AVCodec* codec = avcodec_find_decoder_by_name("mpeg2video");
++    if (codec == nullptr) {
++        if (error) *error = "No software decoder for mpeg2video";
++        return nullptr;
++    }
++    return OpenCodec(parameters, time_base, codec, error);
++}
++
++void LogCallback(void* avcl, int level, const char* format, va_list args) {
++    if (level > AV_LOG_INFO) return;
++    static int print_prefix = 1;
++    char line[1024];
++    av_log_format_line2(avcl, level, format, args, line, sizeof(line), &print_prefix);
++    const int priority = level <= AV_LOG_ERROR ? ANDROID_LOG_ERROR
++            : level <= AV_LOG_WARNING ? ANDROID_LOG_WARN : ANDROID_LOG_INFO;
++    __android_log_write(priority, "komorebi-ffmpeg", line);
++}
++
++struct Session {
++    PacketQueue packets{64, 8U * 1024U * 1024U};
++    FrameQueue frames{6};
++    std::unique_ptr<VideoDecoder> decoder;
++    AVFieldOrder field_order = AV_FIELD_UNKNOWN;
++
++    std::mutex info_mutex;
++    std::string decoder_name = "none";
++    bool decoder_hardware = false;
++    int effective_mode = -1;
++    std::string backend = "none";
++    std::atomic<int> info_version{0};
++
++    int ResolveMode(int mode) const {
++        if (mode == kAutoVideoMode) return ResolveAutoVideoMode(field_order);
++        return std::clamp(mode, static_cast<int>(VideoMode::kOff),
++                          static_cast<int>(VideoMode::kDeinterlace));
++    }
++};
++
++Session* FromHandle(jlong handle) { return reinterpret_cast<Session*>(handle); }
++
++}  // namespace
++
++extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
++    const int result = av_jni_set_java_vm(vm, nullptr);
++    if (result < 0) {
++        __android_log_print(ANDROID_LOG_ERROR, kTag,
++                            "Failed to register JavaVM with FFmpeg: %d", result);
++        return JNI_ERR;
++    }
++    av_log_set_callback(LogCallback);
++    return JNI_VERSION_1_6;
++}
++
++extern "C" JNIEXPORT jboolean JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeHasDecoder(JNIEnv*, jobject) {
++    return avcodec_find_decoder_by_name("mpeg2video") != nullptr ? JNI_TRUE : JNI_FALSE;
++}
++
++extern "C" JNIEXPORT jlong JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeOpen(
++        JNIEnv* env, jobject, jbyteArray extradata, jint width, jint height,
++        jfloat pixel_ratio, jint frame_rate_num, jint frame_rate_den,
++        jint field_order, jint mode, jboolean prefer_media_codec) {
++    AVCodecParameters* parameters = avcodec_parameters_alloc();
++    if (parameters == nullptr) return 0;
++    parameters->codec_type = AVMEDIA_TYPE_VIDEO;
++    parameters->codec_id = AV_CODEC_ID_MPEG2VIDEO;
++    parameters->width = width;
++    parameters->height = height;
++    if (pixel_ratio > 0.0f) parameters->sample_aspect_ratio = av_d2q(pixel_ratio, 10000);
++    parameters->field_order = static_cast<AVFieldOrder>(field_order);
++    if (extradata != nullptr) {
++        const jsize size = env->GetArrayLength(extradata);
++        if (size > 0) {
++            parameters->extradata = static_cast<uint8_t*>(
++                    av_mallocz(static_cast<size_t>(size) + AV_INPUT_BUFFER_PADDING_SIZE));
++            if (parameters->extradata != nullptr) {
++                env->GetByteArrayRegion(extradata, 0, size,
++                                        reinterpret_cast<jbyte*>(parameters->extradata));
++                parameters->extradata_size = size;
++            }
++        }
++    }
++
++    std::string error;
++    bool decoder_hardware = false;
++    AVCodecContext* decoder = OpenDecoder(parameters, kMicroseconds,
++                                          prefer_media_codec == JNI_TRUE,
++                                          &decoder_hardware, &error);
++    if (decoder == nullptr) {
++        __android_log_print(ANDROID_LOG_ERROR, kTag, "%s", error.c_str());
++        avcodec_parameters_free(&parameters);
++        return 0;
++    }
++
++    AVRational frame_rate{frame_rate_num, frame_rate_den};
++    if (frame_rate.num <= 0 || frame_rate.den <= 0) frame_rate = AVRational{30000, 1001};
++    AVRational sar = parameters->sample_aspect_ratio.num > 0 &&
++                     parameters->sample_aspect_ratio.den > 0
++            ? parameters->sample_aspect_ratio : decoder->sample_aspect_ratio;
++    if (sar.num <= 0 || sar.den <= 0) sar = AVRational{1, 1};
++
++    auto* session = new Session();
++    session->field_order = parameters->field_order;
++    const int resolved_mode = session->ResolveMode(mode);
++    if (mode == kAutoVideoMode) {
++        __android_log_print(
++                ANDROID_LOG_INFO, kTag,
++                "Video mode auto-resolved: field_order=%s(%d) resolution=%dx%d chosen=%s(%d)",
++                FieldOrderName(parameters->field_order), static_cast<int>(parameters->field_order),
++                parameters->width, parameters->height,
++                VideoModeName(resolved_mode), resolved_mode);
++    }
++
++    session->decoder = std::make_unique<VideoDecoder>(
++            decoder, decoder_hardware, parameters, kMicroseconds, frame_rate, sar,
++            session->packets, session->frames,
++            [session](const std::string& name, bool hardware) {
++                {
++                    std::lock_guard<std::mutex> lock(session->info_mutex);
++                    session->decoder_name = name;
++                    session->decoder_hardware = hardware;
++                }
++                session->info_version.fetch_add(1, std::memory_order_acq_rel);
++            },
++            [session](VideoMode effective, const std::string& backend) {
++                {
++                    std::lock_guard<std::mutex> lock(session->info_mutex);
++                    session->effective_mode = static_cast<int>(effective);
++                    session->backend = backend;
++                }
++                session->info_version.fetch_add(1, std::memory_order_acq_rel);
++            },
++            nullptr, nullptr);
++
++    avcodec_parameters_free(&parameters);
++    VideoDecoder& video = *session->decoder;
++    video.SetVideoMode(static_cast<VideoMode>(resolved_mode));
++    // The OpenCL graphs are keyed on real frame metadata (SAR, colour, field order),
++    // which media3's Format does not carry, so warm them up on the first frame.
++    video.PrepareOnFirstFrame();
++    video.Start();
++    return reinterpret_cast<jlong>(session);
++}
++
++extern "C" JNIEXPORT jint JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeQueuePacket(
++        JNIEnv* env, jobject, jlong handle, jobject buffer, jint offset, jint size,
++        jlong time_us, jboolean key_frame, jint serial) {
++    Session* session = FromHandle(handle);
++    auto* data = static_cast<uint8_t*>(env->GetDirectBufferAddress(buffer));
++    if (session == nullptr || data == nullptr || size < 0) return kQueueError;
++    AVPacket* packet = av_packet_alloc();
++    if (packet == nullptr || av_new_packet(packet, size) < 0) {
++        av_packet_free(&packet);
++        return kQueueError;
++    }
++    std::memcpy(packet->data, data + offset, static_cast<size_t>(size));
++    packet->pts = time_us;
++    packet->dts = AV_NOPTS_VALUE;
++    if (key_frame == JNI_TRUE) packet->flags |= AV_PKT_FLAG_KEY;
++    const QueueResult result = session->packets.Put(*packet, serial, false);
++    av_packet_free(&packet);
++    if (result == QueueResult::kOk) return kQueueOk;
++    return result == QueueResult::kFull ? kQueueFull : kQueueError;
++}
++
++extern "C" JNIEXPORT jint JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeQueueEndOfStream(
++        JNIEnv*, jobject, jlong handle, jint serial) {
++    Session* session = FromHandle(handle);
++    if (session == nullptr) return kQueueError;
++    const QueueResult result = session->packets.PutEof(serial, false);
++    if (result == QueueResult::kOk) return kQueueOk;
++    return result == QueueResult::kFull ? kQueueFull : kQueueError;
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeFlush(
++        JNIEnv*, jobject, jlong handle, jint serial, jboolean has_start_time,
++        jlong start_time_us) {
++    Session* session = FromHandle(handle);
++    if (session == nullptr || !session->decoder) return;
++    if (has_start_time == JNI_TRUE) {
++        session->decoder->FlushForSeek(serial, start_time_us);
++    } else {
++        session->decoder->Flush(serial);
++    }
++}
++
++extern "C" JNIEXPORT jint JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeDequeueFrame(
++        JNIEnv* env, jobject, jlong handle, jint serial, jlongArray out) {
++    Session* session = FromHandle(handle);
++    if (session == nullptr) return kDequeueNone;
++    while (true) {
++        FrameItem item;
++        if (session->frames.Pop(&item, false) != QueueResult::kOk) return kDequeueNone;
++        if (item.serial != serial) continue;
++        if (item.end_of_stream) return kDequeueEndOfStream;
++        if (item.frame == nullptr) continue;
++        jlong values[4];
++        values[0] = reinterpret_cast<jlong>(item.frame);
++        values[1] = static_cast<jlong>(std::llround(item.pts_seconds * 1000000.0));
++        values[2] = item.frame->width;
++        values[3] = item.frame->height;
++        item.frame = nullptr;
++        env->SetLongArrayRegion(out, 0, 4, values);
++        return kDequeueFrame;
++    }
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeReleaseFrame(
++        JNIEnv*, jobject, jlong handle, jlong frame) {
++    Session* session = FromHandle(handle);
++    auto* value = reinterpret_cast<AVFrame*>(frame);
++    // Mapped OpenCL frames go back to the filter thread, which frees them.
++    if (session != nullptr) {
++        session->frames.Return(&value);
++    } else {
++        av_frame_free(&value);
++    }
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeSetMode(
++        JNIEnv*, jobject, jlong handle, jint mode) {
++    Session* session = FromHandle(handle);
++    if (session == nullptr || !session->decoder) return;
++    const int resolved = session->ResolveMode(mode);
++    __android_log_print(ANDROID_LOG_INFO, kTag, "Video mode requested=%d chosen=%s(%d)",
++                        mode, VideoModeName(resolved), resolved);
++    session->decoder->SetVideoMode(static_cast<VideoMode>(resolved));
++}
++
++extern "C" JNIEXPORT jint JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeLastError(JNIEnv*, jobject, jlong handle) {
++    Session* session = FromHandle(handle);
++    if (session == nullptr || !session->decoder) return AVERROR(EINVAL);
++    if (session->decoder->running()) return 0;
++    const int error = session->decoder->last_error();
++    return error != 0 ? error : AVERROR_UNKNOWN;
++}
++
++extern "C" JNIEXPORT jint JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeInfoVersion(JNIEnv*, jobject, jlong handle) {
++    Session* session = FromHandle(handle);
++    return session == nullptr ? 0 : session->info_version.load(std::memory_order_acquire);
++}
++
++extern "C" JNIEXPORT jstring JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeInfo(JNIEnv* env, jobject, jlong handle) {
++    Session* session = FromHandle(handle);
++    if (session == nullptr) return nullptr;
++    std::string info;
++    {
++        std::lock_guard<std::mutex> lock(session->info_mutex);
++        info = session->decoder_name + "\t" + (session->decoder_hardware ? "1" : "0") + "\t" +
++               std::to_string(session->effective_mode) + "\t" + session->backend;
++    }
++    return env->NewStringUTF(info.c_str());
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeClose(JNIEnv*, jobject, jlong handle) {
++    Session* session = FromHandle(handle);
++    if (session == nullptr) return;
++    if (session->decoder && !session->decoder->Stop()) {
++        // The decode thread was detached and may still touch the session.
++        __android_log_print(ANDROID_LOG_ERROR, kTag, "Leaking unresponsive decoder session");
++        return;
++    }
++    delete session;
++}
++
++extern "C" JNIEXPORT jlong JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeSurfaceCreate(JNIEnv*, jobject) {
++    return reinterpret_cast<jlong>(new komorebi::SurfaceOutput());
++}
++
++extern "C" JNIEXPORT jboolean JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeSurfaceRender(
++        JNIEnv* env, jobject, jlong output, jobject surface, jlong handle, jlong frame) {
++    auto* target = reinterpret_cast<komorebi::SurfaceOutput*>(output);
++    const auto* value = reinterpret_cast<const AVFrame*>(frame);
++    if (target == nullptr || value == nullptr || surface == nullptr ||
++        !IsRenderableFormat(value->format)) {
++        return JNI_FALSE;
++    }
++    Session* session = FromHandle(handle);
++    return target->Submit(env, surface, *value, session != nullptr ? &session->frames : nullptr)
++            ? JNI_TRUE : JNI_FALSE;
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeSurfaceDrain(JNIEnv*, jobject, jlong output) {
++    auto* target = reinterpret_cast<komorebi::SurfaceOutput*>(output);
++    if (target != nullptr) target->Drain();
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeSurfaceDetach(
++        JNIEnv* env, jobject, jlong output) {
++    auto* target = reinterpret_cast<komorebi::SurfaceOutput*>(output);
++    if (target != nullptr) target->Detach(env);
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_kr_dcmys_komorebi_video_NativeVideo_nativeSurfaceRelease(
++        JNIEnv* env, jobject, jlong output) {
++    auto* target = reinterpret_cast<komorebi::SurfaceOutput*>(output);
++    if (target == nullptr) return;
++    target->Detach(env);
++    delete target;
++}
+diff --git a/app/src/main/cpp/komorebi-video/video/FilterGraph.cpp b/app/src/main/cpp/komorebi-video/video/FilterGraph.cpp
+new file mode 100644
+index 0000000..21f3fdb
+--- /dev/null
++++ b/app/src/main/cpp/komorebi-video/video/FilterGraph.cpp
+@@ -0,0 +1,1148 @@
++#include "video/FilterGraph.h"
++
++#include <android/log.h>
++#include <time.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <condition_variable>
++#include <cstdio>
++#include <memory>
++#include <sstream>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#ifndef CL_TARGET_OPENCL_VERSION
++#define CL_TARGET_OPENCL_VERSION 120
++#endif
++
++extern "C" {
++#include <libavfilter/buffersink.h>
++#include <libavfilter/buffersrc.h>
++#include <libavutil/error.h>
++#include <libavutil/hwcontext.h>
++#include <libavutil/hwcontext_opencl.h>
++#include <libavutil/pixdesc.h>
++}
++
++#pragma weak clGetDeviceInfo
++#pragma weak clGetPlatformInfo
++
++namespace aribplayer {
++namespace {
++constexpr char kTag[] = "aribplayer-filter";
++
++std::string AvError(int error) {
++    char text[AV_ERROR_MAX_STRING_SIZE]{};
++    av_strerror(error, text, sizeof(text));
++    return text;
++}
++
++int NormalizeVideoModeValue(int value) {
++    if (value == 1) value = static_cast<int>(VideoMode::kDeinterlace);
++    return std::clamp(value, static_cast<int>(VideoMode::kOff),
++                      static_cast<int>(VideoMode::kDeinterlace));
++}
++
++const char* PixelFormatName(int format) {
++    if (format < 0) return "none";
++    const char* name = av_get_pix_fmt_name(static_cast<AVPixelFormat>(format));
++    return name != nullptr ? name : "unknown";
++}
++
++std::string PixelFormatList(const enum AVPixelFormat* formats) {
++    if (formats == nullptr) return "unknown";
++    std::ostringstream result;
++    bool first = true;
++    for (const enum AVPixelFormat* format = formats; *format != AV_PIX_FMT_NONE; ++format) {
++        if (!first) result << '|';
++        result << PixelFormatName(*format);
++        first = false;
++    }
++    return first ? "none" : result.str();
++}
++
++bool IsRendererSupportedFormat(int format) {
++    return format == AV_PIX_FMT_NV12 || format == AV_PIX_FMT_YUV420P ||
++           format == AV_PIX_FMT_YUVJ420P;
++}
++
++bool ContainsPixelFormat(const enum AVPixelFormat* formats, int format) {
++    if (formats == nullptr) return false;
++    for (const enum AVPixelFormat* candidate = formats;
++         *candidate != AV_PIX_FMT_NONE; ++candidate) {
++        if (*candidate == format) return true;
++    }
++    return false;
++}
++
++int SelectOpenClSoftwareFormat(int input_format, const AVHWFramesConstraints* constraints) {
++    if (constraints == nullptr || constraints->valid_sw_formats == nullptr) return AV_PIX_FMT_NONE;
++    if (IsRendererSupportedFormat(input_format) &&
++        ContainsPixelFormat(constraints->valid_sw_formats, input_format)) {
++        return input_format;
++    }
++    if (ContainsPixelFormat(constraints->valid_sw_formats, AV_PIX_FMT_YUV420P)) {
++        return AV_PIX_FMT_YUV420P;
++    }
++    if (ContainsPixelFormat(constraints->valid_sw_formats, AV_PIX_FMT_NV12)) {
++        return AV_PIX_FMT_NV12;
++    }
++    return AV_PIX_FMT_NONE;
++}
++
++std::string QueryOpenClDeviceString(cl_device_id device, cl_device_info parameter) {
++    if (device == nullptr || clGetDeviceInfo == nullptr) return "unavailable";
++    size_t size = 0;
++    if (clGetDeviceInfo(device, parameter, 0, nullptr, &size) != CL_SUCCESS || size == 0) {
++        return "unavailable";
++    }
++    std::vector<char> value(size, '\0');
++    if (clGetDeviceInfo(device, parameter, value.size(), value.data(), nullptr) != CL_SUCCESS) {
++        return "unavailable";
++    }
++    return std::string(value.data());
++}
++
++std::string QueryOpenClPlatformString(cl_platform_id platform, cl_platform_info parameter) {
++    if (platform == nullptr || clGetPlatformInfo == nullptr) return "unavailable";
++    size_t size = 0;
++    if (clGetPlatformInfo(platform, parameter, 0, nullptr, &size) != CL_SUCCESS || size == 0) {
++        return "unavailable";
++    }
++    std::vector<char> value(size, '\0');
++    if (clGetPlatformInfo(platform, parameter, value.size(), value.data(), nullptr) != CL_SUCCESS) {
++        return "unavailable";
++    }
++    return std::string(value.data());
++}
++
++void LogOpenClDeviceInfo(AVBufferRef* device) {
++    const auto* device_context = device != nullptr
++            ? reinterpret_cast<const AVHWDeviceContext*>(device->data) : nullptr;
++    const auto* opencl_context = device_context != nullptr
++            ? static_cast<const AVOpenCLDeviceContext*>(device_context->hwctx) : nullptr;
++    const cl_device_id device_id = opencl_context != nullptr ? opencl_context->device_id : nullptr;
++    cl_platform_id platform = nullptr;
++    if (device_id != nullptr && clGetDeviceInfo != nullptr) {
++        clGetDeviceInfo(device_id, CL_DEVICE_PLATFORM, sizeof(platform), &platform, nullptr);
++    }
++    __android_log_print(
++            ANDROID_LOG_INFO, kTag,
++            "OpenCL device info: device=%s vendor=%s version=%s platform=%s "
++            "platform_vendor=%s platform_version=%s id=%p",
++            QueryOpenClDeviceString(device_id, CL_DEVICE_NAME).c_str(),
++            QueryOpenClDeviceString(device_id, CL_DEVICE_VENDOR).c_str(),
++            QueryOpenClDeviceString(device_id, CL_DEVICE_VERSION).c_str(),
++            QueryOpenClPlatformString(platform, CL_PLATFORM_NAME).c_str(),
++            QueryOpenClPlatformString(platform, CL_PLATFORM_VENDOR).c_str(),
++            QueryOpenClPlatformString(platform, CL_PLATFORM_VERSION).c_str(),
++            static_cast<void*>(device_id));
++}
++
++int EffectiveColorRange(const OpenClGraphKey& key) {
++    if (key.format == AV_PIX_FMT_YUVJ420P && key.color_range == AVCOL_RANGE_UNSPECIFIED) {
++        return AVCOL_RANGE_JPEG;
++    }
++    return key.color_range;
++}
++
++bool IsFullRange(const OpenClGraphKey& key) {
++    return EffectiveColorRange(key) == AVCOL_RANGE_JPEG ||
++           key.format == AV_PIX_FMT_YUVJ420P;
++}
++
++void FreeBundle(FilterGraph::GraphBundle* bundle) {
++    if (bundle == nullptr) return;
++    avfilter_graph_free(&bundle->graph);
++    bundle->source = nullptr;
++    bundle->sink = nullptr;
++    bundle->sink_time_base = AVRational{0, 1};
++}
++
++int LinkFilters(AVFilterContext* source, AVFilterContext* destination) {
++    if (source == nullptr || destination == nullptr) return AVERROR(EINVAL);
++    return avfilter_link(source, 0, destination, 0);
++}
++
++unsigned OpenClModeBit(VideoMode mode) {
++    switch (mode) {
++        case VideoMode::kIvtc: return 1U << 0;
++        case VideoMode::kDeinterlace: return 1U << 1;
++        default: return 0;
++    }
++}
++
++constexpr int64_t kOpenClProbeDeadlineMs = 1500;
++
++enum class OpenClProbeState { kUnknown, kProbing, kReady, kUnavailable };
++
++struct OpenClProbeSpec {
++    OpenClGraphKey key;
++    AVFieldOrder field_order = AV_FIELD_UNKNOWN;
++    int opencl_sw_format = AV_PIX_FMT_NONE;
++};
++
++struct OpenClProbeResult {
++    OpenClGraphKey key;
++    unsigned ready_modes = 0;
++    unsigned failed_modes = 0;
++    FilterGraph::GraphBundle ivtc;
++    FilterGraph::GraphBundle deinterlace;
++};
++
++struct OpenClProbeControl {
++    std::mutex mutex;
++    std::condition_variable condition;
++    OpenClProbeState state = OpenClProbeState::kProbing;
++    bool worker_done = false;
++    bool result_taken = false;
++    unsigned ready_modes = 0;
++    unsigned failed_modes = 0;
++    std::chrono::steady_clock::time_point deadline{};
++    OpenClGraphKey key;
++    FilterGraph::GraphBundle ivtc;
++    FilterGraph::GraphBundle deinterlace;
++};
++
++void MoveBundle(FilterGraph::GraphBundle* destination,
++                FilterGraph::GraphBundle* source) {
++    if (destination == nullptr || source == nullptr) return;
++    *destination = *source;
++    source->graph = nullptr;
++    source->source = nullptr;
++    source->sink = nullptr;
++    source->sink_time_base = AVRational{0, 1};
++}
++
++bool BuildBundleForSpec(const OpenClProbeSpec& spec, VideoMode mode, bool opencl,
++                        AVBufferRef* opencl_device, FilterGraph::GraphBundle* bundle,
++                        std::string* error);
++void RunOpenClProbe(const std::shared_ptr<OpenClProbeControl>& control,
++                    const OpenClProbeSpec& spec);
++
++class OpenClProbeCoordinator final {
++public:
++    static OpenClProbeCoordinator& Instance() {
++        static OpenClProbeCoordinator* coordinator = new OpenClProbeCoordinator();
++        return *coordinator;
++    }
++
++    void StartIfUnknown(const OpenClProbeSpec& spec) {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (process_state_ == OpenClProbeState::kUnavailable || control_ != nullptr) return;
++        StartProbeLocked(spec);
++    }
++
++    bool Acquire(const OpenClProbeSpec& spec, OpenClProbeResult* result) {
++        if (result == nullptr) return false;
++        StartIfUnknown(spec);
++
++        std::shared_ptr<OpenClProbeControl> control;
++        bool wait_for_worker = false;
++        {
++            std::lock_guard<std::mutex> coordinator_lock(mutex_);
++            if (process_state_ == OpenClProbeState::kUnavailable) return false;
++            if (control_ == nullptr) StartProbeLocked(spec);
++            control = control_;
++            if (control == nullptr) return false;
++
++            OpenClProbeState worker_state;
++            bool result_taken = false;
++            OpenClGraphKey worker_key;
++            {
++                std::lock_guard<std::mutex> control_lock(control->mutex);
++                worker_state = control->state;
++                result_taken = control->result_taken;
++                worker_key = control->key;
++            }
++
++            if (worker_state == OpenClProbeState::kUnavailable) {
++                process_state_ = OpenClProbeState::kUnavailable;
++                JoinWorkerIfCurrentLocked(control);
++                return false;
++            }
++            if (worker_state == OpenClProbeState::kProbing) {
++                // A different key must not make this open wait behind another
++                // session's build. It will use software and a later open may try.
++                if (!(worker_key == spec.key)) return false;
++                wait_for_worker = true;
++            } else if (worker_state == OpenClProbeState::kReady &&
++                       (result_taken || !(worker_key == spec.key))) {
++                // The compiler is known to be healthy, but the prepared graph
++                // is single-use or keyed to another format. Join the completed
++                // worker before replacing its control block so there is still
++                // only one process-global worker at a time.
++                process_state_ = OpenClProbeState::kReady;
++                JoinWorkerIfCurrentLocked(control);
++                StartProbeLocked(spec);
++                control = control_;
++                wait_for_worker = true;
++            }
++        }
++
++        if (wait_for_worker) {
++            std::unique_lock<std::mutex> control_lock(control->mutex);
++            if (control->state == OpenClProbeState::kProbing) {
++                const auto deadline = control->deadline;
++                if (!control->condition.wait_until(control_lock, deadline, [&control] {
++                        return control->worker_done ||
++                               control->state != OpenClProbeState::kProbing;
++                    })) {
++                    control_lock.unlock();
++                    LatchTimeout(control);
++                    return false;
++                }
++            }
++        }
++
++        std::lock_guard<std::mutex> coordinator_lock(mutex_);
++        JoinWorkerIfCurrentLocked(control);
++        std::lock_guard<std::mutex> control_lock(control->mutex);
++        if (control->state == OpenClProbeState::kUnavailable) {
++            process_state_ = OpenClProbeState::kUnavailable;
++            return false;
++        }
++        if (process_state_ == OpenClProbeState::kUnavailable ||
++            control->state != OpenClProbeState::kReady || control->result_taken ||
++            !(control->key == spec.key)) {
++            return false;
++        }
++        result->key = control->key;
++        result->ready_modes = control->ready_modes;
++        result->failed_modes = control->failed_modes;
++        MoveBundle(&result->ivtc, &control->ivtc);
++        MoveBundle(&result->deinterlace, &control->deinterlace);
++        control->result_taken = true;
++        if (process_state_ == OpenClProbeState::kProbing) {
++            process_state_ = OpenClProbeState::kReady;
++        }
++        return true;
++    }
++
++    void Snapshot(OpenClProbeState* state, unsigned* ready_modes,
++                   unsigned* failed_modes) {
++        std::lock_guard<std::mutex> coordinator_lock(mutex_);
++        OpenClProbeState snapshot = process_state_;
++        if (control_ != nullptr) {
++            std::lock_guard<std::mutex> control_lock(control_->mutex);
++            if (control_->state == OpenClProbeState::kUnavailable) {
++                process_state_ = OpenClProbeState::kUnavailable;
++                snapshot = process_state_;
++            }
++        }
++        if (state) *state = snapshot;
++        if (ready_modes) *ready_modes = snapshot == OpenClProbeState::kReady ? 3U : 0U;
++        // Mode failures are per prepared key and are checked by FilterGraph;
++        // kReady here reports only that the process-wide compiler is healthy.
++        if (failed_modes) *failed_modes = 0;
++    }
++
++private:
++    OpenClProbeCoordinator() = default;
++
++    ~OpenClProbeCoordinator() {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (worker_.joinable()) worker_.detach();
++    }
++
++    void StartProbeLocked(const OpenClProbeSpec& spec) {
++        control_ = std::make_shared<OpenClProbeControl>();
++        control_->key = spec.key;
++        control_->deadline = std::chrono::steady_clock::now() +
++                              std::chrono::milliseconds(kOpenClProbeDeadlineMs);
++        if (process_state_ == OpenClProbeState::kUnknown) {
++            process_state_ = OpenClProbeState::kProbing;
++        }
++        worker_ = std::thread(RunOpenClProbe, control_, spec);
++    }
++
++    void JoinWorkerIfCurrentLocked(const std::shared_ptr<OpenClProbeControl>& control) {
++        if (control_ == control && worker_.joinable()) {
++            worker_.join();
++        }
++    }
++
++    void LatchTimeout(const std::shared_ptr<OpenClProbeControl>& control) {
++        bool won = false;
++        {
++            std::lock_guard<std::mutex> coordinator_lock(mutex_);
++            if (process_state_ == OpenClProbeState::kUnavailable) return;
++            std::lock_guard<std::mutex> control_lock(control->mutex);
++            if (control->state == OpenClProbeState::kProbing) {
++                control->state = OpenClProbeState::kUnavailable;
++                control->ready_modes = 0;
++                control->failed_modes = 0;
++                process_state_ = OpenClProbeState::kUnavailable;
++                if (control_ == control && worker_.joinable()) worker_.detach();
++                won = true;
++            }
++        }
++        control->condition.notify_all();
++        if (!won) return;
++        __android_log_print(ANDROID_LOG_WARN, kTag,
++                            "OpenCL probe timed out after 1500ms; disabled for process");
++    }
++
++    mutable std::mutex mutex_;
++    OpenClProbeState process_state_ = OpenClProbeState::kUnknown;
++    std::shared_ptr<OpenClProbeControl> control_;
++    std::thread worker_;
++};
++
++}  // namespace
++
++FilterGraph::FilterGraph(AVRational time_base, AVRational frame_rate,
++                         AVRational stream_sar, AVFieldOrder field_order,
++                         FrameQueue& output, InfoCallback info_callback)
++    : time_base_(time_base.num > 0 && time_base.den > 0 ? time_base : AVRational{1, 90000}),
++      frame_rate_(frame_rate.num > 0 && frame_rate.den > 0 ? frame_rate : AVRational{30000, 1001}),
++      stream_sar_(stream_sar.num > 0 && stream_sar.den > 0 ? stream_sar : AVRational{1, 1}),
++      field_order_(field_order),
++      output_(output),
++      info_callback_(std::move(info_callback)) {}
++
++FilterGraph::~FilterGraph() {
++    ResetInternal();
++    FreePreparedBundles();
++}
++
++void FilterGraph::SetMode(VideoMode mode) {
++    const int value = NormalizeVideoModeValue(static_cast<int>(mode));
++    requested_mode_.store(value, std::memory_order_release);
++}
++
++void FilterGraph::Prepare(const AVFrame& prototype) {
++    const VideoMode requested = static_cast<VideoMode>(
++            requested_mode_.load(std::memory_order_acquire));
++    if (requested == VideoMode::kOff) return;
++
++    OpenClProbeSpec spec;
++    spec.key = MakeGraphKey(prototype);
++    spec.field_order = field_order_;
++    OpenClProbeResult result;
++    if (!OpenClProbeCoordinator::Instance().Acquire(spec, &result)) return;
++
++    FreePreparedBundles();
++    failed_opencl_modes_ = result.failed_modes;
++    prepared_opencl_modes_ = result.ready_modes;
++    if ((prepared_opencl_modes_ & OpenClModeBit(VideoMode::kIvtc)) != 0) {
++        MoveBundle(&prepared_ivtc_, &result.ivtc);
++        prepared_ivtc_key_ = result.key;
++    }
++    if ((prepared_opencl_modes_ & OpenClModeBit(VideoMode::kDeinterlace)) != 0) {
++        MoveBundle(&prepared_deinterlace_, &result.deinterlace);
++        prepared_deinterlace_key_ = result.key;
++    }
++}
++
++void FilterGraph::Reset() {
++    ResetInternal();
++    observed_mode_ = static_cast<VideoMode>(
++            requested_mode_.load(std::memory_order_acquire));
++    effective_mode_ = observed_mode_;
++    backend_ = "none";
++    info_reported_ = false;
++    if (effective_mode_ == VideoMode::kOff) ReportInfo();
++}
++
++void FilterGraph::ResetInternal() {
++    FreeBundle(&active_);
++    graph_width_ = 0;
++    graph_height_ = 0;
++    graph_format_ = -1;
++    active_key_ = OpenClGraphKey{};
++    failed_graph_key_ = OpenClGraphKey{};
++    failed_graph_key_valid_ = false;
++}
++
++bool FilterGraph::Process(AVFrame* frame, int serial) {
++    if (frame == nullptr) return false;
++    RecordInput();
++
++    const VideoMode requested = static_cast<VideoMode>(
++            requested_mode_.load(std::memory_order_acquire));
++    if (requested != observed_mode_) {
++        ResetInternal();
++        observed_mode_ = requested;
++        effective_mode_ = requested;
++        backend_ = "none";
++        info_reported_ = false;
++        if (effective_mode_ == VideoMode::kOff) ReportInfo();
++    }
++
++    return ProcessResolved(frame, serial);
++}
++
++bool FilterGraph::ProcessResolved(AVFrame* frame, int serial) {
++    if (effective_mode_ == VideoMode::kOff) return PushBypass(*frame, serial);
++    const OpenClGraphKey key = MakeGraphKey(*frame);
++    if (active_.graph != nullptr && !(active_key_ == key)) {
++        FreeBundle(&active_);
++        graph_width_ = 0;
++        graph_height_ = 0;
++        graph_format_ = -1;
++        active_key_ = OpenClGraphKey{};
++        failed_graph_key_ = OpenClGraphKey{};
++        failed_graph_key_valid_ = false;
++        backend_ = "none";
++        info_reported_ = false;
++    }
++    if (failed_graph_key_valid_ && !(failed_graph_key_ == key)) {
++        failed_graph_key_valid_ = false;
++    }
++    if (failed_graph_key_valid_ && failed_graph_key_ == key) {
++        return PushBypass(*frame, serial);
++    }
++    if (active_.graph == nullptr && !BuildForFrame(*frame)) {
++        // A filter failure must not turn a playable stream into a black screen.
++        // Keep the requested mode and bypass only this graph key until it changes.
++        failed_graph_key_ = key;
++        failed_graph_key_valid_ = true;
++        backend_ = "none";
++        ReportInfo();
++        return PushBypass(*frame, serial);
++    }
++
++    const auto wall_start = std::chrono::steady_clock::now();
++    const int64_t cpu_start = ThreadCpuNanoseconds();
++    int result = av_buffersrc_add_frame_flags(active_.source, frame, AV_BUFFERSRC_FLAG_KEEP_REF);
++    int produced = 0;
++    double queue_wait_ms = 0.0;
++    bool ok = result >= 0;
++    if (ok) ok = DrainSink(serial, &produced, &queue_wait_ms);
++    const int64_t cpu_end = ThreadCpuNanoseconds();
++    const auto wall_end = std::chrono::steady_clock::now();
++    const double wall_ms = std::max(0.0,
++            std::chrono::duration<double, std::milli>(wall_end - wall_start).count() -
++            queue_wait_ms);
++    const double cpu_ms = cpu_start >= 0 && cpu_end >= cpu_start
++            ? static_cast<double>(cpu_end - cpu_start) / 1000000.0 : 0.0;
++    RecordFilterTiming(wall_ms, cpu_ms);
++    if (result < 0) {
++        __android_log_print(ANDROID_LOG_ERROR, kTag, "buffersrc failed: %s", AvError(result).c_str());
++    }
++    return ok;
++}
++
++bool FilterGraph::PushBypass(const AVFrame& frame, int serial) {
++    const bool ok = output_.Push(frame, serial, FramePtsSeconds(frame, time_base_), true) ==
++                    QueueResult::kOk;
++    if (ok) RecordOutput(1);
++    return ok;
++}
++
++bool FilterGraph::BuildForFrame(const AVFrame& frame) {
++    std::string error;
++    if (EnsureOpenCl(frame, effective_mode_) &&
++        TakePreparedBundle(frame, effective_mode_, &active_)) {
++        backend_ = "opencl";
++        graph_width_ = frame.width;
++        graph_height_ = frame.height;
++        graph_format_ = frame.format;
++        active_key_ = MakeGraphKey(frame);
++        ReportInfo();
++        return true;
++    }
++
++    FreeBundle(&active_);
++    error.clear();
++    if (BuildBundle(frame, effective_mode_, false, &active_, &error)) {
++        backend_ = "software";
++        graph_width_ = frame.width;
++        graph_height_ = frame.height;
++        graph_format_ = frame.format;
++        active_key_ = MakeGraphKey(frame);
++        ReportInfo();
++        return true;
++    }
++    __android_log_print(ANDROID_LOG_ERROR, kTag, "Unable to build filter graph: %s", error.c_str());
++    FreeBundle(&active_);
++    return false;
++}
++
++bool FilterGraph::EnsureOpenCl(const AVFrame& frame, VideoMode mode) {
++    const unsigned mode_bit = OpenClModeBit(mode);
++    if (mode_bit == 0 || (failed_opencl_modes_ & mode_bit) != 0) return false;
++
++    OpenClProbeState state = OpenClProbeState::kUnknown;
++    unsigned ready_modes = 0;
++    unsigned failed_modes = 0;
++    OpenClProbeCoordinator::Instance().Snapshot(&state, &ready_modes, &failed_modes);
++    if (state != OpenClProbeState::kReady || (ready_modes & mode_bit) == 0 ||
++        (failed_modes & mode_bit) != 0) {
++        return false;
++    }
++    return (prepared_opencl_modes_ & mode_bit) != 0 &&
++           ((mode == VideoMode::kIvtc ? prepared_ivtc_key_ : prepared_deinterlace_key_) ==
++            MakeGraphKey(frame));
++}
++
++bool FilterGraph::TakePreparedBundle(const AVFrame& frame, VideoMode mode,
++                                     GraphBundle* bundle) {
++    const unsigned mode_bit = OpenClModeBit(mode);
++    if (bundle == nullptr || (prepared_opencl_modes_ & mode_bit) == 0) return false;
++    const OpenClGraphKey key = MakeGraphKey(frame);
++    if (mode == VideoMode::kIvtc) {
++        if (!(prepared_ivtc_key_ == key)) return false;
++        MoveBundle(bundle, &prepared_ivtc_);
++        prepared_ivtc_key_ = OpenClGraphKey{};
++    } else if (mode == VideoMode::kDeinterlace) {
++        if (!(prepared_deinterlace_key_ == key)) return false;
++        MoveBundle(bundle, &prepared_deinterlace_);
++        prepared_deinterlace_key_ = OpenClGraphKey{};
++    } else {
++        return false;
++    }
++    prepared_opencl_modes_ &= ~mode_bit;
++    return true;
++}
++
++OpenClGraphKey FilterGraph::MakeGraphKey(const AVFrame& frame) const {
++    OpenClGraphKey key;
++    key.width = frame.width;
++    key.height = frame.height;
++    key.format = frame.format;
++    key.colorspace = frame.colorspace;
++    key.color_range = frame.color_range;
++    if (key.format == AV_PIX_FMT_YUVJ420P && key.color_range == AVCOL_RANGE_UNSPECIFIED) {
++        key.color_range = AVCOL_RANGE_JPEG;
++    }
++    key.sample_aspect_ratio = frame.sample_aspect_ratio.num > 0 &&
++                              frame.sample_aspect_ratio.den > 0
++            ? frame.sample_aspect_ratio : stream_sar_;
++    key.time_base = time_base_;
++    key.frame_rate = frame_rate_;
++    key.top_field_first = FrameIsTopFieldFirst(frame, field_order_);
++    key.valid = key.width > 0 && key.height > 0 && key.format >= 0 &&
++                key.sample_aspect_ratio.num > 0 && key.sample_aspect_ratio.den > 0 &&
++                key.time_base.num > 0 && key.time_base.den > 0 &&
++                key.frame_rate.num > 0 && key.frame_rate.den > 0;
++    return key;
++}
++
++void FilterGraph::FreePreparedBundles() {
++    FreeBundle(&prepared_ivtc_);
++    FreeBundle(&prepared_deinterlace_);
++    prepared_opencl_modes_ = 0;
++    prepared_ivtc_key_ = OpenClGraphKey{};
++    prepared_deinterlace_key_ = OpenClGraphKey{};
++}
++
++namespace {
++
++bool BuildBundleForSpec(const OpenClProbeSpec& spec, VideoMode mode, bool opencl,
++                        AVBufferRef* opencl_device, FilterGraph::GraphBundle* bundle,
++                        std::string* error) {
++    const OpenClGraphKey& key = spec.key;
++    if (bundle == nullptr || !key.valid ||
++        (mode != VideoMode::kIvtc && mode != VideoMode::kDeinterlace)) {
++        if (error) *error = "invalid graph request";
++        return false;
++    }
++    if (opencl && !IsRendererSupportedFormat(spec.opencl_sw_format)) {
++        if (error) *error = "OpenCL format selection unavailable";
++        return false;
++    }
++    FreeBundle(bundle);
++    bundle->graph = avfilter_graph_alloc();
++    if (bundle->graph == nullptr) {
++        if (error) *error = "unable to allocate filter graph";
++        return false;
++    }
++
++    const AVFilter* buffer_filter = avfilter_get_by_name("buffer");
++    const AVFilter* sink_filter = avfilter_get_by_name("buffersink");
++    if (buffer_filter == nullptr || sink_filter == nullptr) {
++        if (error) *error = "buffer filters unavailable";
++        FreeBundle(bundle);
++        return false;
++    }
++
++    char source_args[512]{};
++    std::snprintf(source_args, sizeof(source_args),
++                  "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d:frame_rate=%d/%d:colorspace=%d:range=%d",
++                  key.width, key.height, key.format, key.time_base.num, key.time_base.den,
++                  key.sample_aspect_ratio.num, key.sample_aspect_ratio.den,
++                  key.frame_rate.num, key.frame_rate.den, key.colorspace,
++                  EffectiveColorRange(key));
++    int result = avfilter_graph_create_filter(&bundle->source, buffer_filter, "in",
++                                               source_args, nullptr, bundle->graph);
++    if (result < 0) {
++        if (error) *error = "buffer: " + AvError(result);
++        __android_log_print(ANDROID_LOG_ERROR, kTag,
++                            "%s buffer stage failed: %s (%d)",
++                            opencl ? "OpenCL" : "software", AvError(result).c_str(), result);
++        FreeBundle(bundle);
++        return false;
++    }
++
++    AVFilterContext* previous = bundle->source;
++    auto add_filter = [&](const char* filter_name, const char* instance_name,
++                          const char* args, bool attach_device) -> bool {
++        const AVFilter* filter = avfilter_get_by_name(filter_name);
++        if (filter == nullptr) {
++            if (error) *error = std::string("missing filter ") + filter_name;
++            return false;
++        }
++        AVFilterContext* context = nullptr;
++        if (attach_device) {
++            if (opencl_device == nullptr) {
++                if (error) *error = std::string("missing OpenCL device for ") + filter_name;
++                return false;
++            }
++            context = avfilter_graph_alloc_filter(bundle->graph, filter, instance_name);
++            if (context == nullptr) {
++                if (error) *error = std::string("allocate ") + filter_name;
++                return false;
++            }
++            context->hw_device_ctx = av_buffer_ref(opencl_device);
++            if (context->hw_device_ctx == nullptr) {
++                if (error) *error = std::string("device ref for ") + filter_name;
++                return false;
++            }
++            result = avfilter_init_str(context, args);
++        } else {
++            result = avfilter_graph_create_filter(&context, filter, instance_name,
++                                                   args, nullptr, bundle->graph);
++        }
++        if (result < 0) {
++            if (error) *error = std::string(filter_name) + ": " + AvError(result);
++            __android_log_print(ANDROID_LOG_ERROR, kTag,
++                                "%s %s init stage failed: %s (%d)",
++                                opencl ? "OpenCL" : "software", filter_name,
++                                AvError(result).c_str(), result);
++            return false;
++        }
++        result = LinkFilters(previous, context);
++        if (result < 0) {
++            if (error) *error = std::string("link ") + filter_name + ": " + AvError(result);
++            __android_log_print(ANDROID_LOG_ERROR, kTag,
++                                "%s link %s stage failed: %s (%d)",
++                                opencl ? "OpenCL" : "software", filter_name,
++                                AvError(result).c_str(), result);
++            return false;
++        }
++        previous = context;
++        return true;
++    };
++
++    const char* parity = key.top_field_first ? "tff" : "bff";
++    if (opencl) {
++        const int selected_format = spec.opencl_sw_format;
++        const bool full_range = IsFullRange(key);
++        if (selected_format != key.format) {
++            const std::string upload_format_args =
++                    std::string("pix_fmts=") + PixelFormatName(selected_format);
++            if (!add_filter("format", "format_upload", upload_format_args.c_str(), false) ||
++                (full_range && selected_format != AV_PIX_FMT_YUVJ420P &&
++                 !add_filter("setparams", "range_upload", "range=full", false))) {
++                FreeBundle(bundle);
++                return false;
++            }
++        }
++        if (!add_filter("hwupload", "hwupload", nullptr, true)) {
++            FreeBundle(bundle);
++            return false;
++        }
++        std::string processing_args;
++        const char* processing_filter = nullptr;
++        if (mode == VideoMode::kIvtc) {
++            processing_filter = "ivtc_opencl";
++            processing_args = std::string("tff=") + (key.top_field_first ? "1" : "0");
++        } else {
++            processing_filter = "bwdif_opencl";
++            processing_args = std::string("mode=send_field:parity=") + parity + ":deint=all";
++        }
++        const std::string download_format_args =
++                std::string("pix_fmts=") + PixelFormatName(selected_format);
++        if (!add_filter(processing_filter, "process", processing_args.c_str(), true) ||
++            !add_filter("hwmap", "hwmap", "mode=read", false) ||
++            !add_filter("format", "format_download", download_format_args.c_str(), false) ||
++            (full_range && selected_format != AV_PIX_FMT_YUVJ420P &&
++             !add_filter("setparams", "range_download", "range=full", false))) {
++            FreeBundle(bundle);
++            return false;
++        }
++    } else if (mode == VideoMode::kIvtc) {
++        const std::string field_args = std::string("order=") + parity + ":combmatch=full";
++        if (!add_filter("fieldmatch", "fieldmatch", field_args.c_str(), false) ||
++            !add_filter("decimate", "decimate", nullptr, false)) {
++            FreeBundle(bundle);
++            return false;
++        }
++    } else {
++        const std::string bwdif_args = std::string("mode=send_field:parity=") + parity + ":deint=all";
++        if (!add_filter("bwdif", "bwdif", bwdif_args.c_str(), false)) {
++            FreeBundle(bundle);
++            return false;
++        }
++    }
++
++    result = avfilter_graph_create_filter(&bundle->sink, sink_filter, "out",
++                                           nullptr, nullptr, bundle->graph);
++    if (result < 0) {
++        if (error) *error = "buffersink: " + AvError(result);
++        __android_log_print(ANDROID_LOG_ERROR, kTag,
++                            "%s buffersink init stage failed: %s (%d)",
++                            opencl ? "OpenCL" : "software", AvError(result).c_str(), result);
++        FreeBundle(bundle);
++        return false;
++    }
++    result = LinkFilters(previous, bundle->sink);
++    if (result < 0) {
++        if (error) *error = "link buffersink: " + AvError(result);
++        __android_log_print(ANDROID_LOG_ERROR, kTag,
++                            "%s link buffersink stage failed: %s (%d)",
++                            opencl ? "OpenCL" : "software", AvError(result).c_str(), result);
++        FreeBundle(bundle);
++        return false;
++    }
++    result = avfilter_graph_config(bundle->graph, nullptr);
++    if (result < 0) {
++        if (error) *error = "graph config: " + AvError(result);
++        __android_log_print(ANDROID_LOG_ERROR, kTag,
++                            "%s graph-config stage failed: %s (%d)",
++                            opencl ? "OpenCL" : "software", AvError(result).c_str(), result);
++        FreeBundle(bundle);
++        return false;
++    }
++    bundle->sink_time_base = av_buffersink_get_time_base(bundle->sink);
++    if (bundle->sink_time_base.num <= 0 || bundle->sink_time_base.den <= 0) {
++        if (error) *error = "invalid output time base";
++        FreeBundle(bundle);
++        return false;
++    }
++    return true;
++}
++
++}  // namespace
++
++bool FilterGraph::BuildBundle(const AVFrame& frame, VideoMode mode, bool opencl,
++                              GraphBundle* bundle, std::string* error) {
++    if (opencl) {
++        if (error) *error = "OpenCL graph was not prepared before decode";
++        return false;
++    }
++    OpenClProbeSpec spec;
++    spec.key = MakeGraphKey(frame);
++    spec.field_order = field_order_;
++    return BuildBundleForSpec(spec, mode, false, nullptr, bundle, error);
++}
++
++namespace {
++
++void RunOpenClProbe(const std::shared_ptr<OpenClProbeControl>& control,
++                    const OpenClProbeSpec& spec) {
++    AVBufferRef* device = nullptr;
++    const auto device_start = std::chrono::steady_clock::now();
++    const int device_result = av_hwdevice_ctx_create(
++            &device, AV_HWDEVICE_TYPE_OPENCL, nullptr, nullptr, 0);
++    const double device_ms = std::chrono::duration<double, std::milli>(
++            std::chrono::steady_clock::now() - device_start).count();
++    __android_log_print(ANDROID_LOG_INFO, kTag,
++                        "OpenCL device-create completed in %.1f ms (result=%d)",
++                        device_ms, device_result);
++
++    if (device_result < 0 || device == nullptr) {
++        __android_log_print(ANDROID_LOG_INFO, kTag,
++                            "OpenCL unavailable: result=%d error=%s",
++                            device_result, AvError(device_result).c_str());
++        {
++            std::lock_guard<std::mutex> lock(control->mutex);
++            if (control->state == OpenClProbeState::kProbing) {
++                control->state = OpenClProbeState::kUnavailable;
++                control->ready_modes = 0;
++                control->failed_modes = 0;
++            }
++            control->worker_done = true;
++        }
++        control->condition.notify_all();
++        av_buffer_unref(&device);
++        return;
++    }
++
++    LogOpenClDeviceInfo(device);
++    __android_log_print(
++            ANDROID_LOG_INFO, kTag,
++            "OpenCL probe format: %dx%d %s(%d)",
++            spec.key.width, spec.key.height, PixelFormatName(spec.key.format), spec.key.format);
++    AVHWFramesConstraints* constraints = av_hwdevice_get_hwframe_constraints(device, nullptr);
++    __android_log_print(
++            ANDROID_LOG_INFO, kTag,
++            "OpenCL valid_sw_formats: %s min=%dx%d max=%dx%d",
++            constraints != nullptr ? PixelFormatList(constraints->valid_sw_formats).c_str() : "unavailable",
++            constraints != nullptr ? constraints->min_width : 0,
++            constraints != nullptr ? constraints->min_height : 0,
++            constraints != nullptr ? constraints->max_width : 0,
++            constraints != nullptr ? constraints->max_height : 0);
++    const int selected_format = SelectOpenClSoftwareFormat(
++            spec.key.format, constraints);
++    av_hwframe_constraints_free(&constraints);
++    if (selected_format == AV_PIX_FMT_NONE) {
++        __android_log_print(
++                ANDROID_LOG_ERROR, kTag,
++                "OpenCL format selection failed: probe=%s(%d) no compatible software format",
++                PixelFormatName(spec.key.format), spec.key.format);
++        {
++            std::lock_guard<std::mutex> lock(control->mutex);
++            if (control->state == OpenClProbeState::kProbing) {
++                control->key = spec.key;
++                control->ready_modes = 0;
++                control->failed_modes = OpenClModeBit(VideoMode::kIvtc) |
++                                        OpenClModeBit(VideoMode::kDeinterlace);
++                control->state = OpenClProbeState::kReady;
++            }
++            control->worker_done = true;
++        }
++        control->condition.notify_all();
++        av_buffer_unref(&device);
++        return;
++    }
++    __android_log_print(
++            ANDROID_LOG_INFO, kTag,
++            "OpenCL selected software format: %s(%d)",
++            PixelFormatName(selected_format), selected_format);
++
++    OpenClProbeSpec build_spec = spec;
++    build_spec.opencl_sw_format = selected_format;
++    FilterGraph::GraphBundle ivtc;
++    FilterGraph::GraphBundle deinterlace;
++    unsigned ready_modes = 0;
++    unsigned failed_modes = 0;
++    for (const VideoMode mode : {VideoMode::kIvtc, VideoMode::kDeinterlace}) {
++        FilterGraph::GraphBundle bundle;
++        std::string error;
++        const auto build_start = std::chrono::steady_clock::now();
++        const bool ok = BuildBundleForSpec(build_spec, mode, true, device, &bundle, &error);
++        const double build_ms = std::chrono::duration<double, std::milli>(
++                std::chrono::steady_clock::now() - build_start).count();
++        const char* mode_name = mode == VideoMode::kIvtc ? "ivtc" : "bwdif";
++        __android_log_print(ANDROID_LOG_INFO, kTag,
++                            "OpenCL %s-build completed in %.1f ms%s",
++                            mode_name, build_ms, ok ? "" : " (failed)");
++        if (!ok) {
++            __android_log_print(ANDROID_LOG_INFO, kTag,
++                                "OpenCL %s filter probe failed: %s",
++                                mode_name, error.c_str());
++            FreeBundle(&bundle);
++            failed_modes |= OpenClModeBit(mode);
++        } else {
++            ready_modes |= OpenClModeBit(mode);
++            if (mode == VideoMode::kIvtc) MoveBundle(&ivtc, &bundle);
++            else MoveBundle(&deinterlace, &bundle);
++        }
++    }
++
++    {
++        std::lock_guard<std::mutex> lock(control->mutex);
++        if (control->state != OpenClProbeState::kProbing) {
++            FreeBundle(&ivtc);
++            FreeBundle(&deinterlace);
++        } else {
++            control->key = spec.key;
++            control->ready_modes = ready_modes;
++            control->failed_modes = failed_modes;
++            MoveBundle(&control->ivtc, &ivtc);
++            MoveBundle(&control->deinterlace, &deinterlace);
++            control->state = OpenClProbeState::kReady;
++        }
++        control->worker_done = true;
++    }
++    control->condition.notify_all();
++    av_buffer_unref(&device);
++}
++
++}  // namespace
++
++void FilterGraph::StartOpenClProbe(const AVFrame& prototype, AVRational time_base,
++                                   AVRational frame_rate, AVRational stream_sar,
++                                   AVFieldOrder field_order) {
++    OpenClGraphKey key;
++    key.width = prototype.width;
++    key.height = prototype.height;
++    key.format = prototype.format;
++    key.colorspace = prototype.colorspace;
++    key.color_range = prototype.color_range;
++    if (key.format == AV_PIX_FMT_YUVJ420P && key.color_range == AVCOL_RANGE_UNSPECIFIED) {
++        key.color_range = AVCOL_RANGE_JPEG;
++    }
++    key.sample_aspect_ratio = prototype.sample_aspect_ratio.num > 0 &&
++                              prototype.sample_aspect_ratio.den > 0
++            ? prototype.sample_aspect_ratio : stream_sar;
++    key.time_base = time_base;
++    key.frame_rate = frame_rate;
++    if ((prototype.flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) != 0) {
++        key.top_field_first = true;
++    } else if ((prototype.flags & AV_FRAME_FLAG_INTERLACED) != 0) {
++        key.top_field_first = false;
++    } else {
++        switch (field_order) {
++            case AV_FIELD_BB:
++            case AV_FIELD_BT:
++                key.top_field_first = false;
++                break;
++            default:
++                key.top_field_first = true;
++                break;
++        }
++    }
++    key.valid = key.width > 0 && key.height > 0 && key.format >= 0 &&
++                key.sample_aspect_ratio.num > 0 && key.sample_aspect_ratio.den > 0 &&
++                key.time_base.num > 0 && key.time_base.den > 0 &&
++                key.frame_rate.num > 0 && key.frame_rate.den > 0;
++    if (!key.valid) return;
++    OpenClProbeSpec spec;
++    spec.key = key;
++    spec.field_order = field_order;
++    OpenClProbeCoordinator::Instance().StartIfUnknown(spec);
++}
++
++
++bool FilterGraph::DrainSink(int serial, int* produced, double* queue_wait_ms) {
++    AVFrame* filtered = av_frame_alloc();
++    if (filtered == nullptr) return false;
++    bool ok = true;
++    int count = 0;
++    while (true) {
++        const int result = av_buffersink_get_frame(active_.sink, filtered);
++        if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) break;
++        if (result < 0) {
++            __android_log_print(ANDROID_LOG_ERROR, kTag, "buffersink failed: %s", AvError(result).c_str());
++            ok = false;
++            break;
++        }
++        if (!IsSupportedSoftwareFormat(filtered->format)) {
++            __android_log_print(ANDROID_LOG_ERROR, kTag, "Unsupported filtered format: %s",
++                                av_get_pix_fmt_name(static_cast<AVPixelFormat>(filtered->format)));
++            ok = false;
++            av_frame_unref(filtered);
++            break;
++        }
++        const int64_t output_timestamp = filtered->pts != AV_NOPTS_VALUE
++                ? filtered->pts : filtered->best_effort_timestamp;
++        const double pts = output_timestamp == AV_NOPTS_VALUE ? 0.0
++                : output_timestamp * av_q2d(active_.sink_time_base);
++        const auto queue_start = std::chrono::steady_clock::now();
++        const QueueResult queue_result = output_.Push(*filtered, serial, pts, true);
++        const auto queue_end = std::chrono::steady_clock::now();
++        if (queue_wait_ms) {
++            *queue_wait_ms += std::chrono::duration<double, std::milli>(
++                    queue_end - queue_start).count();
++        }
++        if (queue_result != QueueResult::kOk) {
++            ok = false;
++            av_frame_unref(filtered);
++            break;
++        }
++        ++count;
++        av_frame_unref(filtered);
++    }
++    av_frame_free(&filtered);
++    if (count > 0) RecordOutput(count);
++    if (produced) *produced += count;
++    return ok;
++}
++
++bool FilterGraph::EndOfStream(int serial) {
++    if (active_.graph == nullptr) return true;
++    int result = av_buffersrc_add_frame_flags(active_.source, nullptr, 0);
++    if (result < 0 && result != AVERROR_EOF) return false;
++    int produced = 0;
++    return DrainSink(serial, &produced);
++}
++
++void FilterGraph::ReportInfo() {
++    bool changed = false;
++    {
++        std::lock_guard<std::mutex> lock(stats_mutex_);
++        changed = !info_reported_ ||
++                  reported_effective_mode_ != static_cast<int>(effective_mode_) ||
++                  reported_backend_ != backend_;
++        reported_effective_mode_ = static_cast<int>(effective_mode_);
++        reported_backend_ = backend_;
++    }
++    info_reported_ = true;
++    if (changed && info_callback_) info_callback_(effective_mode_, backend_);
++}
++
++void FilterGraph::RecordInput() {
++    std::lock_guard<std::mutex> lock(stats_mutex_);
++    RollStatsWindowLocked(std::chrono::steady_clock::now());
++    ++input_frames_;
++}
++
++void FilterGraph::RecordOutput(int count) {
++    std::lock_guard<std::mutex> lock(stats_mutex_);
++    RollStatsWindowLocked(std::chrono::steady_clock::now());
++    output_frames_ += static_cast<uint64_t>(std::max(0, count));
++}
++
++void FilterGraph::RecordFilterTiming(double wall_ms, double cpu_ms) {
++    std::lock_guard<std::mutex> lock(stats_mutex_);
++    ++timed_frames_;
++    total_filter_ms_ += wall_ms;
++    total_thread_cpu_ms_ += cpu_ms;
++}
++
++void FilterGraph::RollStatsWindowLocked(std::chrono::steady_clock::time_point now) const {
++    const double seconds = std::chrono::duration<double>(now - stats_started_).count();
++    if (seconds < 2.0) return;
++    rolling_in_fps_ = static_cast<double>(input_frames_) / seconds;
++    rolling_out_fps_ = static_cast<double>(output_frames_) / seconds;
++    input_frames_ = 0;
++    output_frames_ = 0;
++    stats_started_ = now;
++}
++
++VideoFilterStats FilterGraph::GetStats() const {
++    std::lock_guard<std::mutex> lock(stats_mutex_);
++    const auto now = std::chrono::steady_clock::now();
++    RollStatsWindowLocked(now);
++    const double seconds = std::max(0.001,
++            std::chrono::duration<double>(now - stats_started_).count());
++    VideoFilterStats result;
++    result.requested_mode = requested_mode_.load(std::memory_order_acquire);
++    result.effective_mode = reported_effective_mode_;
++    result.backend = reported_backend_;
++    result.in_fps = input_frames_ > 0 ? static_cast<double>(input_frames_) / seconds : rolling_in_fps_;
++    result.out_fps = output_frames_ > 0 ? static_cast<double>(output_frames_) / seconds : rolling_out_fps_;
++    result.avg_filter_ms = timed_frames_ > 0 ? total_filter_ms_ / timed_frames_ : 0.0;
++    result.filter_thread_cpu_ms = total_thread_cpu_ms_;
++    return result;
++}
++
++bool FilterGraph::IsSupportedSoftwareFormat(int format) {
++    return format == AV_PIX_FMT_NV12 || format == AV_PIX_FMT_YUV420P ||
++           format == AV_PIX_FMT_YUVJ420P;
++}
++
++bool FilterGraph::FrameIsTopFieldFirst(const AVFrame& frame, AVFieldOrder field_order) {
++    if ((frame.flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) != 0) return true;
++    if ((frame.flags & AV_FRAME_FLAG_INTERLACED) != 0) return false;
++    switch (field_order) {
++        case AV_FIELD_BB:
++        case AV_FIELD_BT:
++            return false;
++        case AV_FIELD_TT:
++        case AV_FIELD_TB:
++            return true;
++        default:
++            return true;
++    }
++}
++
++double FilterGraph::FramePtsSeconds(const AVFrame& frame, AVRational time_base) {
++    const int64_t timestamp = frame.best_effort_timestamp != AV_NOPTS_VALUE
++            ? frame.best_effort_timestamp : frame.pts;
++    return timestamp == AV_NOPTS_VALUE ? 0.0 : timestamp * av_q2d(time_base);
++}
++
++int64_t FilterGraph::ThreadCpuNanoseconds() {
++    timespec value{};
++    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) return -1;
++    return static_cast<int64_t>(value.tv_sec) * 1000000000LL + value.tv_nsec;
++}
++
++}  // namespace aribplayer
+diff --git a/app/src/main/cpp/komorebi-video/video/FilterGraph.h b/app/src/main/cpp/komorebi-video/video/FilterGraph.h
+new file mode 100644
+index 0000000..3907755
+--- /dev/null
++++ b/app/src/main/cpp/komorebi-video/video/FilterGraph.h
+@@ -0,0 +1,161 @@
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <functional>
++#include <mutex>
++#include <string>
++
++#include "common/MediaQueues.h"
++
++extern "C" {
++#include <libavcodec/defs.h>
++#include <libavfilter/avfilter.h>
++#include <libavutil/buffer.h>
++#include <libavutil/frame.h>
++#include <libavutil/rational.h>
++}
++
++namespace aribplayer {
++
++enum class VideoMode : int {
++    kOff = 0,
++    // Integer value 1 is intentionally unused by FilterGraph; PlayerCore resolves it before handoff.
++    kIvtc = 2,
++    kDeinterlace = 3,
++};
++
++struct VideoFilterStats {
++    int requested_mode = 0;
++    int effective_mode = 0;
++    std::string backend = "none";
++    double in_fps = 0.0;
++    double out_fps = 0.0;
++    double avg_filter_ms = 0.0;
++    double filter_thread_cpu_ms = 0.0;
++};
++
++struct OpenClGraphKey {
++    int width = 0;
++    int height = 0;
++    int format = -1;
++    int colorspace = 0;
++    int color_range = 0;
++    AVRational sample_aspect_ratio{0, 1};
++    AVRational time_base{0, 1};
++    AVRational frame_rate{0, 1};
++    bool top_field_first = true;
++    bool valid = false;
++
++    bool operator==(const OpenClGraphKey& other) const {
++        return valid == other.valid && width == other.width && height == other.height &&
++               format == other.format && colorspace == other.colorspace &&
++               color_range == other.color_range &&
++               sample_aspect_ratio.num == other.sample_aspect_ratio.num &&
++               sample_aspect_ratio.den == other.sample_aspect_ratio.den &&
++               time_base.num == other.time_base.num && time_base.den == other.time_base.den &&
++               frame_rate.num == other.frame_rate.num && frame_rate.den == other.frame_rate.den &&
++               top_field_first == other.top_field_first;
++    }
++};
++
++// Single-thread-owned FFmpeg video filter graph. All graph operations happen on
++// the filter thread; only mode requests and statistics snapshots cross threads.
++class FilterGraph final {
++public:
++    using InfoCallback = std::function<void(VideoMode, const std::string&)>;
++
++    FilterGraph(AVRational time_base, AVRational frame_rate, AVRational stream_sar,
++                AVFieldOrder field_order, FrameQueue& output, InfoCallback info_callback);
++    ~FilterGraph();
++
++    FilterGraph(const FilterGraph&) = delete;
++    FilterGraph& operator=(const FilterGraph&) = delete;
++
++    // Starts the single process-global probe without waiting. PlayerCore calls
++    // this on the open path; Prepare() waits for the bounded result before the
++    // decoder thread starts.
++    static void StartOpenClProbe(const AVFrame& prototype, AVRational time_base,
++                                 AVRational frame_rate, AVRational stream_sar,
++                                 AVFieldOrder field_order);
++
++    void SetMode(VideoMode mode);
++    // Warms the OpenCL device and processing kernels before playback packets
++    // enter the decode path. The prototype needs only format metadata.
++    void Prepare(const AVFrame& prototype);
++    void Reset();
++    bool Process(AVFrame* frame, int serial);
++    bool EndOfStream(int serial);
++    VideoFilterStats GetStats() const;
++
++    struct GraphBundle {
++        AVFilterGraph* graph = nullptr;
++        AVFilterContext* source = nullptr;
++        AVFilterContext* sink = nullptr;
++        AVRational sink_time_base{0, 1};
++    };
++
++private:
++    void ResetInternal();
++    bool ProcessResolved(AVFrame* frame, int serial);
++    bool PushBypass(const AVFrame& frame, int serial);
++    bool BuildForFrame(const AVFrame& frame);
++    bool BuildBundle(const AVFrame& frame, VideoMode mode, bool opencl,
++                     GraphBundle* bundle, std::string* error);
++    bool EnsureOpenCl(const AVFrame& frame, VideoMode mode);
++    bool TakePreparedBundle(const AVFrame& frame, VideoMode mode, GraphBundle* bundle);
++    OpenClGraphKey MakeGraphKey(const AVFrame& frame) const;
++    void FreePreparedBundles();
++    bool DrainSink(int serial, int* produced, double* queue_wait_ms = nullptr);
++    void ReportInfo();
++    void RecordInput();
++    void RecordOutput(int count);
++    void RecordFilterTiming(double wall_ms, double cpu_ms);
++    void RollStatsWindowLocked(std::chrono::steady_clock::time_point now) const;
++    static bool IsSupportedSoftwareFormat(int format);
++    static bool FrameIsTopFieldFirst(const AVFrame& frame, AVFieldOrder field_order);
++    static double FramePtsSeconds(const AVFrame& frame, AVRational time_base);
++    static int64_t ThreadCpuNanoseconds();
++
++    const AVRational time_base_;
++    const AVRational frame_rate_;
++    const AVRational stream_sar_;
++    const AVFieldOrder field_order_;
++    FrameQueue& output_;
++    InfoCallback info_callback_;
++
++    std::atomic<int> requested_mode_{static_cast<int>(VideoMode::kDeinterlace)};
++    VideoMode observed_mode_ = VideoMode::kDeinterlace;
++    VideoMode effective_mode_ = VideoMode::kDeinterlace;
++    bool info_reported_ = false;
++    std::string backend_ = "none";
++    GraphBundle active_;
++    int graph_width_ = 0;
++    int graph_height_ = 0;
++    int graph_format_ = -1;
++    OpenClGraphKey active_key_;
++    OpenClGraphKey failed_graph_key_;
++    bool failed_graph_key_valid_ = false;
++
++    unsigned prepared_opencl_modes_ = 0;
++    unsigned failed_opencl_modes_ = 0;
++    GraphBundle prepared_ivtc_;
++    GraphBundle prepared_deinterlace_;
++    OpenClGraphKey prepared_ivtc_key_;
++    OpenClGraphKey prepared_deinterlace_key_;
++
++    mutable std::mutex stats_mutex_;
++    int reported_effective_mode_ = 0;
++    std::string reported_backend_ = "none";
++    mutable std::chrono::steady_clock::time_point stats_started_ = std::chrono::steady_clock::now();
++    mutable uint64_t input_frames_ = 0;
++    mutable uint64_t output_frames_ = 0;
++    mutable double rolling_in_fps_ = 0.0;
++    mutable double rolling_out_fps_ = 0.0;
++    uint64_t timed_frames_ = 0;
++    double total_filter_ms_ = 0.0;
++    double total_thread_cpu_ms_ = 0.0;
++};
++
++}  // namespace aribplayer
+diff --git a/app/src/main/cpp/komorebi-video/video/VideoDecoder.cpp b/app/src/main/cpp/komorebi-video/video/VideoDecoder.cpp
+new file mode 100644
+index 0000000..3915e36
+--- /dev/null
++++ b/app/src/main/cpp/komorebi-video/video/VideoDecoder.cpp
+@@ -0,0 +1,589 @@
++#include "video/VideoDecoder.h"
++
++#include <android/log.h>
++
++#include <cmath>
++#include <utility>
++
++extern "C" {
++#include <libavutil/error.h>
++#include <libavutil/mathematics.h>
++#include <libavutil/pixdesc.h>
++}
++
++namespace aribplayer {
++namespace {
++constexpr char kTag[] = "aribplayer-decoder";
++
++constexpr std::size_t kDecodedFrameQueueCapacity = 2;
++// Bounds how long returned frames stay mapped while the filter thread has no input.
++constexpr std::chrono::milliseconds kReturnedFrameReleaseInterval{100};
++
++std::string AvError(int error) {
++    char text[AV_ERROR_MAX_STRING_SIZE]{};
++    av_strerror(error, text, sizeof(text));
++    return text;
++}
++
++const AVCodec* FindSoftwareCodec(AVCodecID codec_id) {
++    switch (codec_id) {
++        case AV_CODEC_ID_H264:
++            if (const AVCodec* codec = avcodec_find_decoder_by_name("h264")) return codec;
++            break;
++        case AV_CODEC_ID_MPEG2VIDEO:
++            if (const AVCodec* codec = avcodec_find_decoder_by_name("mpeg2video")) return codec;
++            break;
++        default:
++            break;
++    }
++    return avcodec_find_decoder(codec_id);
++}
++
++}  // namespace
++
++VideoDecoder::VideoDecoder(AVCodecContext* decoder, bool decoder_is_hardware,
++                           const AVCodecParameters* codec_parameters,
++                           AVRational stream_time_base, AVRational frame_rate,
++                           AVRational stream_sar, PacketQueue& packets, FrameQueue& frames,
++                           DecoderInfoCallback decoder_info,
++                           FilterInfoCallback filter_info,
++                           FallbackSeekCallback fallback_seek,
++                           VideoSizeCallback video_size)
++    : decoder_(decoder),
++      time_base_(stream_time_base),
++      frame_rate_(frame_rate),
++      stream_sar_(stream_sar),
++      packets_(packets),
++      frames_(frames),
++      decoder_info_callback_(std::move(decoder_info)),
++      fallback_seek_callback_(std::move(fallback_seek)),
++      video_size_callback_(std::move(video_size)),
++      decoder_name_(decoder != nullptr && decoder->codec != nullptr ? decoder->codec->name : "unknown"),
++      decoder_is_hardware_(decoder_is_hardware),
++      decoded_frames_(kDecodedFrameQueueCapacity) {
++    if (decoder_ != nullptr) {
++        default_skip_loop_filter_ = decoder_->skip_loop_filter;
++        default_skip_frame_ = decoder_->skip_frame;
++    }
++    codec_parameters_ = avcodec_parameters_alloc();
++    if (codec_parameters_ == nullptr || codec_parameters == nullptr ||
++        avcodec_parameters_copy(codec_parameters_, codec_parameters) < 0) {
++        avcodec_parameters_free(&codec_parameters_);
++    }
++    const AVFieldOrder field_order = codec_parameters != nullptr
++            ? codec_parameters->field_order : AV_FIELD_UNKNOWN;
++    filter_ = std::make_unique<FilterGraph>(
++            time_base_, frame_rate_, stream_sar_, field_order, frames_, std::move(filter_info));
++}
++
++VideoDecoder::~VideoDecoder() {
++    Stop();
++    decoded_frames_.Flush();
++    filter_.reset();
++    avcodec_free_context(&decoder_);
++    avcodec_parameters_free(&codec_parameters_);
++}
++
++void VideoDecoder::Prepare() {
++    if (filter_ == nullptr || decoder_ == nullptr || codec_parameters_ == nullptr) return;
++
++    AVFrame* prototype = av_frame_alloc();
++    if (prototype == nullptr) return;
++    prototype->width = decoder_->width > 0 ? decoder_->width : codec_parameters_->width;
++    prototype->height = decoder_->height > 0 ? decoder_->height : codec_parameters_->height;
++    const int decoder_format = static_cast<int>(decoder_->pix_fmt);
++    prototype->format = IsRenderableFormat(decoder_format)
++            ? decoder_format
++            : (IsRenderableFormat(codec_parameters_->format)
++                    ? codec_parameters_->format : AV_PIX_FMT_YUV420P);
++    prototype->sample_aspect_ratio = decoder_->sample_aspect_ratio.num > 0 &&
++                                     decoder_->sample_aspect_ratio.den > 0
++            ? decoder_->sample_aspect_ratio : stream_sar_;
++    prototype->colorspace = decoder_->colorspace != AVCOL_SPC_UNSPECIFIED
++            ? decoder_->colorspace : codec_parameters_->color_space;
++    prototype->color_range = decoder_->color_range != AVCOL_RANGE_UNSPECIFIED
++            ? decoder_->color_range : codec_parameters_->color_range;
++    switch (codec_parameters_->field_order) {
++        case AV_FIELD_TT:
++        case AV_FIELD_TB:
++            prototype->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
++            break;
++        case AV_FIELD_BB:
++        case AV_FIELD_BT:
++            prototype->flags |= AV_FRAME_FLAG_INTERLACED;
++            break;
++        default:
++            break;
++    }
++
++    if (prototype->width > 0 && prototype->height > 0) {
++        filter_->SetMode(static_cast<VideoMode>(requested_mode_.load(std::memory_order_acquire)));
++        filter_->Prepare(*prototype);
++    }
++    av_frame_free(&prototype);
++}
++
++void VideoDecoder::Start() {
++    if (decoder_ == nullptr || codec_parameters_ == nullptr ||
++        running_.exchange(true, std::memory_order_acq_rel)) {
++        return;
++    }
++    {
++        std::lock_guard<std::mutex> lock(thread_mutex_);
++        if (thread_abandoned_) {
++            running_.store(false, std::memory_order_release);
++            return;
++        }
++        thread_finished_ = false;
++        live_threads_ = 2;
++    }
++    stop_requested_.store(false, std::memory_order_release);
++    eof_generation_.fetch_add(1, std::memory_order_acq_rel);
++    packets_.Reset();
++    decoded_frames_.Reset();
++    frames_.Reset();
++    filter_epoch_ = 0;
++    if (filter_) {
++        filter_->SetMode(static_cast<VideoMode>(requested_mode_.load(std::memory_order_acquire)));
++        filter_->Reset();
++    }
++    ReportDecoderInfo();
++    filter_thread_ = std::thread(&VideoDecoder::FilterLoop, this);
++    thread_ = std::thread(&VideoDecoder::DecodeLoop, this);
++}
++
++bool VideoDecoder::Stop(int64_t timeout_ms) {
++    stop_requested_.store(true, std::memory_order_release);
++    packets_.Abort();
++    decoded_frames_.Abort();
++    frames_.Abort();
++    if (!thread_.joinable() && !filter_thread_.joinable()) {
++        std::lock_guard<std::mutex> lock(thread_mutex_);
++        return !thread_abandoned_;
++    }
++
++    std::unique_lock<std::mutex> lock(thread_mutex_);
++    const bool finished = thread_cv_.wait_for(
++            lock, std::chrono::milliseconds(std::max<int64_t>(0, timeout_ms)),
++            [this] { return thread_finished_; });
++    lock.unlock();
++    if (!finished) {
++        if (thread_.joinable()) thread_.detach();
++        if (filter_thread_.joinable()) filter_thread_.detach();
++        std::lock_guard<std::mutex> abandoned_lock(thread_mutex_);
++        thread_abandoned_ = true;
++        __android_log_print(ANDROID_LOG_ERROR, kTag,
++                            "teardown: detaching video decoder after %lldms timeout",
++                            static_cast<long long>(timeout_ms));
++        return false;
++    }
++    if (thread_.joinable()) thread_.join();
++    if (filter_thread_.joinable()) filter_thread_.join();
++    running_.store(false, std::memory_order_release);
++    return true;
++}
++
++void VideoDecoder::FinishThread() {
++    bool last = false;
++    {
++        std::lock_guard<std::mutex> lock(thread_mutex_);
++        last = --live_threads_ == 0;
++        if (last) {
++            running_.store(false, std::memory_order_release);
++            thread_finished_ = true;
++        }
++    }
++    if (last) thread_cv_.notify_all();
++}
++
++void VideoDecoder::Flush(int serial) {
++    min_output_serial_.store(serial, std::memory_order_release);
++    requested_flush_serial_.store(serial, std::memory_order_release);
++    packets_.Flush();
++    decoded_frames_.Flush();
++    frames_.Flush();
++}
++
++void VideoDecoder::FlushForSeek(int serial, int64_t target_us) {
++    requested_catchup_target_us_.store(target_us, std::memory_order_relaxed);
++    requested_catchup_serial_.store(serial, std::memory_order_release);
++    Flush(serial);
++}
++
++void VideoDecoder::SetVideoMode(VideoMode mode) {
++    int value = static_cast<int>(mode);
++    if (value == 1) value = static_cast<int>(VideoMode::kDeinterlace);
++    requested_mode_.store(value, std::memory_order_release);
++    if (filter_) filter_->SetMode(static_cast<VideoMode>(value));
++    if (prepare_each_reset_.load(std::memory_order_acquire)) {
++        prepare_pending_.store(true, std::memory_order_release);
++    }
++}
++
++VideoDecoderStats VideoDecoder::GetStats() const {
++    VideoDecoderStats stats;
++    {
++        std::lock_guard<std::mutex> lock(info_mutex_);
++        stats.decoder = decoder_name_;
++        stats.decoder_hw = decoder_is_hardware_;
++    }
++    if (filter_) stats.filter = filter_->GetStats();
++    return stats;
++}
++
++void VideoDecoder::ApplyFlush(int serial) {
++    SetCatchUpOptions(false);
++    if (decoder_ != nullptr) avcodec_flush_buffers(decoder_);
++    ++filter_epoch_;
++    active_serial_ = serial;
++    waiting_for_new_serial_ = false;
++    eof_generation_.fetch_add(1, std::memory_order_acq_rel);
++
++    const int catchup_serial = requested_catchup_serial_.load(std::memory_order_acquire);
++    if (catchup_serial == serial) {
++        catchup_target_us_ = requested_catchup_target_us_.load(std::memory_order_relaxed);
++        catchup_target_timestamp_ = av_rescale_q(
++                catchup_target_us_, AV_TIME_BASE_Q, time_base_);
++        landed_keyframe_timestamp_ = AV_NOPTS_VALUE;
++        catchup_frames_ = 0;
++        catchup_started_ = std::chrono::steady_clock::now();
++        catchup_active_ = catchup_target_us_ != AV_NOPTS_VALUE;
++        SetCatchUpOptions(catchup_active_);
++    } else {
++        catchup_active_ = false;
++        catchup_target_us_ = AV_NOPTS_VALUE;
++        catchup_target_timestamp_ = AV_NOPTS_VALUE;
++        landed_keyframe_timestamp_ = AV_NOPTS_VALUE;
++        catchup_frames_ = 0;
++    }
++}
++
++void VideoDecoder::SetCatchUpOptions(bool enabled) {
++    if (decoder_ == nullptr) return;
++    decoder_->skip_loop_filter = enabled ? AVDISCARD_ALL : default_skip_loop_filter_;
++    decoder_->skip_frame = enabled ? AVDISCARD_NONREF : default_skip_frame_;
++}
++
++void VideoDecoder::FinishCatchUp(int64_t reached_timestamp) {
++    if (!catchup_active_) return;
++    catchup_active_ = false;
++    SetCatchUpOptions(false);
++    int expected_serial = active_serial_;
++    requested_catchup_serial_.compare_exchange_strong(
++            expected_serial, -1, std::memory_order_acq_rel);
++
++    const auto elapsed = std::chrono::steady_clock::now() - catchup_started_;
++    const int64_t decode_ms = std::max<int64_t>(0, std::chrono::duration_cast<
++            std::chrono::milliseconds>(elapsed).count());
++    const int64_t landed_timestamp = landed_keyframe_timestamp_ != AV_NOPTS_VALUE
++            ? landed_keyframe_timestamp_ : reached_timestamp;
++    const int64_t landed_ms = landed_timestamp == AV_NOPTS_VALUE ? -1
++            : av_rescale_q(landed_timestamp, time_base_, AVRational{1, 1000});
++    __android_log_print(
++            ANDROID_LOG_INFO, kTag,
++            "seek: target=%lldms landed_keyframe=%lldms catchup_frames=%d decode_ms=%lld",
++            static_cast<long long>(catchup_target_us_ / 1000),
++            static_cast<long long>(landed_ms), catchup_frames_,
++            static_cast<long long>(decode_ms));
++}
++
++void VideoDecoder::DecodeLoop() {
++    while (!stop_requested_.load(std::memory_order_acquire)) {
++        const int pending_serial = requested_flush_serial_.exchange(-1, std::memory_order_acq_rel);
++        if (pending_serial >= 0) ApplyFlush(pending_serial);
++
++        PacketItem item;
++        const QueueResult queue_result = packets_.Get(&item, true);
++        if (queue_result == QueueResult::kFlushed) continue;
++        if (queue_result != QueueResult::kOk) break;
++        if (active_serial_ != item.serial) {
++            ApplyFlush(item.serial);
++            int expected = item.serial;
++            requested_flush_serial_.compare_exchange_strong(
++                    expected, -1, std::memory_order_acq_rel);
++        }
++        if (waiting_for_new_serial_ && item.serial == active_serial_) continue;
++        if (!SendPacket(item.end_of_stream ? nullptr : item.packet, active_serial_)) break;
++    }
++    decoded_frames_.Abort();
++    FinishThread();
++}
++
++void VideoDecoder::FilterLoop() {
++    unsigned applied_epoch = 0;
++    while (filter_ != nullptr) {
++        DecodedFrame item;
++        const QueueResult pop_result = decoded_frames_.Pop(&item, kReturnedFrameReleaseInterval);
++        frames_.ReleaseReturned();
++        if (pop_result == QueueResult::kFull) continue;
++        if (pop_result != QueueResult::kOk) break;
++        if (item.filter_epoch != applied_epoch) {
++            filter_->SetMode(static_cast<VideoMode>(
++                    requested_mode_.load(std::memory_order_acquire)));
++            filter_->Reset();
++            applied_epoch = item.filter_epoch;
++            if (prepare_each_reset_.load(std::memory_order_acquire)) {
++                prepare_pending_.store(true, std::memory_order_release);
++            }
++        }
++        // Decoded before a flush but handed off after it cleared the queue.
++        if (item.serial < min_output_serial_.load(std::memory_order_acquire)) continue;
++
++        bool ok = false;
++        if (item.end_of_stream) {
++            ok = filter_->EndOfStream(item.serial) &&
++                 frames_.PushEof(item.serial, true) == QueueResult::kOk;
++            if (ok) {
++                eof_drained_generation_.store(item.eof_generation, std::memory_order_release);
++            }
++        } else {
++            if (prepare_pending_.exchange(false, std::memory_order_acq_rel)) {
++                filter_->SetMode(static_cast<VideoMode>(
++                        requested_mode_.load(std::memory_order_acquire)));
++                filter_->Prepare(*item.frame);
++            }
++            ok = filter_->Process(item.frame.get(), item.serial);
++        }
++        if (!ok) break;
++    }
++    frames_.ReleaseReturned();
++    decoded_frames_.Abort();
++    FinishThread();
++}
++
++bool VideoDecoder::QueueDecodedFrame(AVFrame* frame, int serial) {
++    DecodedFrame item;
++    item.frame.reset(av_frame_alloc());
++    if (!item.frame) {
++        last_error_.store(AVERROR(ENOMEM), std::memory_order_release);
++        return false;
++    }
++    av_frame_move_ref(item.frame.get(), frame);
++    item.serial = serial;
++    item.filter_epoch = filter_epoch_;
++    return decoded_frames_.Push(std::move(item)) == QueueResult::kOk;
++}
++
++bool VideoDecoder::SendPacket(const AVPacket* packet, int serial) {
++    if (packet != nullptr) eof_generation_.fetch_add(1, std::memory_order_acq_rel);
++    while (!stop_requested_.load(std::memory_order_acquire)) {
++        const int result = avcodec_send_packet(decoder_, packet);
++        if (result == AVERROR(EAGAIN)) {
++            if (!DrainDecoder(serial, false)) return false;
++            continue;
++        }
++        if (result < 0 && result != AVERROR_EOF) {
++            last_error_.store(result, std::memory_order_release);
++            if (decoder_is_hardware_) return FallBackToSoftware(0.0);
++            return true;  // Bad software packet: keep decoding the stream.
++        }
++        return DrainDecoder(serial, packet == nullptr);
++    }
++    return false;
++}
++
++bool VideoDecoder::DrainDecoder(int serial, bool end_of_stream) {
++    AVFrame* frame = av_frame_alloc();
++    if (frame == nullptr) {
++        last_error_.store(AVERROR(ENOMEM), std::memory_order_release);
++        return false;
++    }
++
++    bool keep_running = true;
++    while (!stop_requested_.load(std::memory_order_acquire)) {
++        const int result = avcodec_receive_frame(decoder_, frame);
++        if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) break;
++        if (result < 0) {
++            last_error_.store(result, std::memory_order_release);
++            if (decoder_is_hardware_ && !received_hardware_frame_) {
++                av_frame_unref(frame);
++                keep_running = FallBackToSoftware(0.0);
++            }
++            break;
++        }
++
++        if (frame->pts == AV_NOPTS_VALUE && frame->best_effort_timestamp != AV_NOPTS_VALUE) {
++            frame->pts = frame->best_effort_timestamp;
++        }
++        const int64_t frame_timestamp = frame->best_effort_timestamp != AV_NOPTS_VALUE
++                ? frame->best_effort_timestamp : frame->pts;
++        const double pts = FramePtsSeconds(*frame, time_base_);
++        if (catchup_active_) {
++            if (landed_keyframe_timestamp_ == AV_NOPTS_VALUE &&
++                frame_timestamp != AV_NOPTS_VALUE) {
++                landed_keyframe_timestamp_ = frame_timestamp;
++            }
++            if (frame_timestamp == AV_NOPTS_VALUE ||
++                frame_timestamp < catchup_target_timestamp_) {
++                ++catchup_frames_;
++                av_frame_unref(frame);
++                continue;
++            }
++            FinishCatchUp(frame_timestamp);
++        }
++        if (!IsRenderableFormat(frame->format)) {
++            last_error_.store(AVERROR(ENOSYS), std::memory_order_release);
++            if (decoder_is_hardware_) {
++                av_frame_unref(frame);
++                keep_running = FallBackToSoftware(pts);
++                break;
++            }
++            __android_log_print(ANDROID_LOG_ERROR, kTag, "Unsupported software output format: %s",
++                                av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format)));
++            av_frame_unref(frame);
++            continue;
++        }
++        if (decoder_is_hardware_) received_hardware_frame_ = true;
++
++        AVRational sar = frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0
++                ? frame->sample_aspect_ratio : stream_sar_;
++        if (sar.num <= 0 || sar.den <= 0) sar = AVRational{1, 1};
++        if (frame->width != last_width_ || frame->height != last_height_ ||
++            av_cmp_q(sar, last_sar_) != 0) {
++            last_width_ = frame->width;
++            last_height_ = frame->height;
++            last_sar_ = sar;
++            if (video_size_callback_) video_size_callback_(frame->width, frame->height, sar);
++        }
++
++        if (filter_ == nullptr || !QueueDecodedFrame(frame, serial)) {
++            keep_running = false;
++            av_frame_unref(frame);
++            break;
++        }
++    }
++    if (keep_running && end_of_stream && catchup_active_) {
++        FinishCatchUp(AV_NOPTS_VALUE);
++    }
++    if (keep_running && end_of_stream && filter_) {
++        DecodedFrame eof;
++        eof.serial = serial;
++        eof.filter_epoch = filter_epoch_;
++        eof.eof_generation = eof_generation_.load(std::memory_order_acquire);
++        eof.end_of_stream = true;
++        keep_running = decoded_frames_.Push(std::move(eof)) == QueueResult::kOk;
++    }
++    av_frame_free(&frame);
++    return keep_running;
++}
++
++bool VideoDecoder::FallBackToSoftware(double position_seconds) {
++    if (!decoder_is_hardware_ || codec_parameters_ == nullptr) return false;
++    std::string error;
++    AVCodecContext* software = OpenSoftwareDecoder(&error);
++    if (software == nullptr) {
++        __android_log_print(ANDROID_LOG_ERROR, kTag, "Software fallback failed: %s", error.c_str());
++        return false;
++    }
++
++    avcodec_free_context(&decoder_);
++    decoder_ = software;
++    default_skip_loop_filter_ = decoder_->skip_loop_filter;
++    default_skip_frame_ = decoder_->skip_frame;
++    {
++        std::lock_guard<std::mutex> lock(info_mutex_);
++        decoder_is_hardware_ = false;
++        decoder_name_ = decoder_->codec != nullptr ? decoder_->codec->name : "software";
++    }
++    received_hardware_frame_ = false;
++    ++filter_epoch_;
++    ReportDecoderInfo();
++
++    const double safe_position = std::isfinite(position_seconds) && position_seconds > 0.0
++            ? position_seconds : 0.0;
++    waiting_for_new_serial_ = fallback_seek_callback_ && fallback_seek_callback_(safe_position);
++    return true;
++}
++
++AVCodecContext* VideoDecoder::OpenSoftwareDecoder(std::string* error) const {
++    if (codec_parameters_ == nullptr) return nullptr;
++    const AVCodec* codec = FindSoftwareCodec(codec_parameters_->codec_id);
++    if (codec == nullptr) {
++        if (error) *error = "software decoder not found";
++        return nullptr;
++    }
++    AVCodecContext* context = avcodec_alloc_context3(codec);
++    if (context == nullptr) {
++        if (error) *error = "decoder allocation failed";
++        return nullptr;
++    }
++    int result = avcodec_parameters_to_context(context, codec_parameters_);
++    if (result >= 0) {
++        context->pkt_timebase = time_base_;
++        result = avcodec_open2(context, codec, nullptr);
++    }
++    if (result < 0) {
++        if (error) *error = std::string(codec->name) + ": " + AvError(result);
++        avcodec_free_context(&context);
++        return nullptr;
++    }
++    return context;
++}
++
++void VideoDecoder::ReportDecoderInfo() {
++    std::string name;
++    bool hardware = false;
++    {
++        std::lock_guard<std::mutex> lock(info_mutex_);
++        name = decoder_name_;
++        hardware = decoder_is_hardware_;
++    }
++    if (decoder_info_callback_) decoder_info_callback_(name, hardware);
++}
++
++QueueResult VideoDecoder::DecodedFrameQueue::Push(DecodedFrame item) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    not_full_.wait(lock, [this] { return aborted_ || items_.size() < capacity_; });
++    if (aborted_) return QueueResult::kAborted;
++    items_.emplace_back(std::move(item));
++    lock.unlock();
++    not_empty_.notify_one();
++    return QueueResult::kOk;
++}
++
++QueueResult VideoDecoder::DecodedFrameQueue::Pop(DecodedFrame* item,
++                                                 std::chrono::milliseconds timeout) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    if (!not_empty_.wait_for(lock, timeout, [this] { return aborted_ || !items_.empty(); })) {
++        return QueueResult::kFull;
++    }
++    if (aborted_) return QueueResult::kAborted;
++    *item = std::move(items_.front());
++    items_.pop_front();
++    lock.unlock();
++    not_full_.notify_one();
++    return QueueResult::kOk;
++}
++
++void VideoDecoder::DecodedFrameQueue::Flush() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    items_.clear();
++    not_full_.notify_all();
++}
++
++void VideoDecoder::DecodedFrameQueue::Abort() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    aborted_ = true;
++    not_empty_.notify_all();
++    not_full_.notify_all();
++}
++
++void VideoDecoder::DecodedFrameQueue::Reset() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    items_.clear();
++    aborted_ = false;
++    not_full_.notify_all();
++}
++
++bool VideoDecoder::IsRenderableFormat(int format) {
++    return format == AV_PIX_FMT_NV12 || format == AV_PIX_FMT_YUV420P ||
++           format == AV_PIX_FMT_YUVJ420P;
++}
++
++double VideoDecoder::FramePtsSeconds(const AVFrame& frame, AVRational time_base) {
++    const int64_t timestamp = frame.best_effort_timestamp != AV_NOPTS_VALUE
++            ? frame.best_effort_timestamp : frame.pts;
++    return timestamp == AV_NOPTS_VALUE ? 0.0 : timestamp * av_q2d(time_base);
++}
++
++}  // namespace aribplayer
+diff --git a/app/src/main/cpp/komorebi-video/video/VideoDecoder.h b/app/src/main/cpp/komorebi-video/video/VideoDecoder.h
+new file mode 100644
+index 0000000..742fb27
+--- /dev/null
++++ b/app/src/main/cpp/komorebi-video/video/VideoDecoder.h
+@@ -0,0 +1,187 @@
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++
++#include "common/MediaQueues.h"
++#include "video/FilterGraph.h"
++
++extern "C" {
++#include <libavcodec/avcodec.h>
++#include <libavutil/rational.h>
++}
++
++namespace aribplayer {
++
++struct VideoDecoderStats {
++    std::string decoder;
++    bool decoder_hw = false;
++    VideoFilterStats filter;
++};
++
++// Video decoder with MediaCodec-first selection supplied by PlayerCore, a
++// software fallback path, and an optional single-thread-owned FilterGraph.
++class VideoDecoder final {
++public:
++    using DecoderInfoCallback = std::function<void(const std::string&, bool)>;
++    using FilterInfoCallback = std::function<void(VideoMode, const std::string&)>;
++    using FallbackSeekCallback = std::function<bool(double)>;
++    using VideoSizeCallback = std::function<void(int, int, AVRational)>;
++
++    VideoDecoder(AVCodecContext* decoder, bool decoder_is_hardware,
++                 const AVCodecParameters* codec_parameters,
++                 AVRational stream_time_base, AVRational frame_rate,
++                 AVRational stream_sar, PacketQueue& packets, FrameQueue& frames,
++                 DecoderInfoCallback decoder_info,
++                 FilterInfoCallback filter_info,
++                 FallbackSeekCallback fallback_seek,
++                 VideoSizeCallback video_size);
++    ~VideoDecoder();
++
++    VideoDecoder(const VideoDecoder&) = delete;
++    VideoDecoder& operator=(const VideoDecoder&) = delete;
++
++    void Start();
++    // Performs filter/OpenCL preparation synchronously before PlayerCore reports
++    // the session prepared.
++    void Prepare();
++    // Prepares on the first frame the filter thread sees, and again after every
++    // filter reset or mode change (a prepared OpenCL graph is single-use).
++    void PrepareOnFirstFrame() {
++        prepare_each_reset_.store(true, std::memory_order_release);
++        prepare_pending_.store(true, std::memory_order_release);
++    }
++    // Signals all queue waits before waiting for the decode and filter threads.
++    // Returns false after detaching non-responsive threads; the owner must
++    // abandon this decoder.
++    bool Stop(int64_t timeout_ms = 500);
++    // Drops queued packets/frames, flushes codec state on the decode thread and
++    // filter state on the filter thread.
++    void Flush(int serial);
++    // Flushes for a seek and drops decoded frames before the absolute stream target.
++    void FlushForSeek(int serial, int64_t target_us);
++    void SetVideoMode(VideoMode mode);
++    VideoDecoderStats GetStats() const;
++
++    bool running() const { return running_.load(std::memory_order_acquire); }
++    bool eof_drained() const {
++        return eof_drained_generation_.load(std::memory_order_acquire) ==
++               eof_generation_.load(std::memory_order_acquire);
++    }
++    int last_error() const { return last_error_.load(std::memory_order_acquire); }
++
++private:
++    struct FrameDeleter {
++        void operator()(AVFrame* frame) const { av_frame_free(&frame); }
++    };
++
++    struct DecodedFrame {
++        std::unique_ptr<AVFrame, FrameDeleter> frame;
++        int serial = 0;
++        unsigned filter_epoch = 0;
++        uint64_t eof_generation = 0;
++        bool end_of_stream = false;
++    };
++
++    class DecodedFrameQueue {
++    public:
++        explicit DecodedFrameQueue(std::size_t capacity) : capacity_(capacity) {}
++
++        QueueResult Push(DecodedFrame item);
++        QueueResult Pop(DecodedFrame* item, std::chrono::milliseconds timeout);
++        void Flush();
++        void Abort();
++        void Reset();
++
++    private:
++        const std::size_t capacity_;
++        std::mutex mutex_;
++        std::condition_variable not_empty_;
++        std::condition_variable not_full_;
++        std::deque<DecodedFrame> items_;
++        bool aborted_ = false;
++    };
++
++    void DecodeLoop();
++    void FilterLoop();
++    void FinishThread();
++    bool QueueDecodedFrame(AVFrame* frame, int serial);
++    bool SendPacket(const AVPacket* packet, int serial);
++    bool DrainDecoder(int serial, bool end_of_stream);
++    void ApplyFlush(int serial);
++    void SetCatchUpOptions(bool enabled);
++    void FinishCatchUp(int64_t reached_timestamp);
++    bool FallBackToSoftware(double position_seconds);
++    AVCodecContext* OpenSoftwareDecoder(std::string* error) const;
++    void ReportDecoderInfo();
++    static bool IsRenderableFormat(int format);
++    static double FramePtsSeconds(const AVFrame& frame, AVRational time_base);
++
++    AVCodecContext* decoder_ = nullptr;
++    AVCodecParameters* codec_parameters_ = nullptr;
++    const AVRational time_base_;
++    const AVRational frame_rate_;
++    const AVRational stream_sar_;
++    PacketQueue& packets_;
++    FrameQueue& frames_;
++    DecoderInfoCallback decoder_info_callback_;
++    FallbackSeekCallback fallback_seek_callback_;
++    VideoSizeCallback video_size_callback_;
++    std::unique_ptr<FilterGraph> filter_;
++
++    mutable std::mutex info_mutex_;
++    std::string decoder_name_;
++    bool decoder_is_hardware_ = false;
++    bool received_hardware_frame_ = false;
++    AVDiscard default_skip_loop_filter_ = AVDISCARD_DEFAULT;
++    AVDiscard default_skip_frame_ = AVDISCARD_DEFAULT;
++    bool catchup_active_ = false;
++    int64_t catchup_target_us_ = AV_NOPTS_VALUE;
++    int64_t catchup_target_timestamp_ = AV_NOPTS_VALUE;
++    int64_t landed_keyframe_timestamp_ = AV_NOPTS_VALUE;
++    int catchup_frames_ = 0;
++    std::chrono::steady_clock::time_point catchup_started_{};
++    bool waiting_for_new_serial_ = false;
++    std::atomic<bool> prepare_each_reset_{false};
++    std::atomic<bool> prepare_pending_{false};
++    int last_width_ = 0;
++    int last_height_ = 0;
++    AVRational last_sar_{0, 1};
++
++    // Decode-thread-only. A change makes the filter thread reset its graph
++    // before the next handed-off frame.
++    unsigned filter_epoch_ = 0;
++    DecodedFrameQueue decoded_frames_;
++
++    std::thread thread_;
++    std::thread filter_thread_;
++    std::mutex thread_mutex_;
++    std::condition_variable thread_cv_;
++    int live_threads_ = 0;
++    bool thread_finished_ = true;
++    bool thread_abandoned_ = false;
++    std::atomic<bool> running_{false};
++    std::atomic<bool> stop_requested_{false};
++    // Bumped on every packet, flush and start; the filter thread publishes the
++    // generation of the EOF it pushed.
++    std::atomic<uint64_t> eof_generation_{0};
++    std::atomic<uint64_t> eof_drained_generation_{UINT64_MAX};
++    std::atomic<int> min_output_serial_{-1};
++    std::atomic<int> requested_flush_serial_{-1};
++    std::atomic<int> requested_catchup_serial_{-1};
++    std::atomic<int64_t> requested_catchup_target_us_{AV_NOPTS_VALUE};
++    std::atomic<int> requested_mode_{static_cast<int>(VideoMode::kDeinterlace)};
++    std::atomic<int> last_error_{0};
++    int active_serial_ = -1;
++};
++
++}  // namespace aribplayer
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/setting/SettingContents.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/setting/SettingContents.kt
+index 33fb9d3..9b2559d 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/setting/SettingContents.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/setting/SettingContents.kt
+@@ -5,6 +5,9 @@ package com.beeregg2001.komorebi.ui.setting
+ import android.os.Build
+ import androidx.annotation.RequiresApi
+ import androidx.compose.foundation.layout.*
++import androidx.compose.ui.platform.LocalContext
++import kr.dcmys.komorebi.video.VideoFilterPrefs
++import kr.dcmys.komorebi.video.label
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.filled.*
+ import androidx.compose.runtime.*
+@@ -642,8 +645,11 @@ fun PlaybackSettingsContent(
+     onLayer: () -> Unit,
+     onUiMode: () -> Unit,
+     onAutoCmSkip: () -> Unit,
++    showVideoFilter: Boolean = false,
++    onVideoFilter: () -> Unit = {},
+     onClick: (FocusRequester) -> Unit
+ ) {
++    val videoFilterR = remember { FocusRequester() }
+     Column(verticalArrangement = Arrangement.spacedBy(24.dp)) {
+         Text(
+             AppStrings.SETTINGS_CATEGORY_PLAYBACK,
+@@ -756,11 +762,27 @@ fun PlaybackSettingsContent(
+                     .focusProperties {
+                         left = sidebarR
+                         up = uiModeR
+-                        down = FocusRequester.Cancel
++                        down = if (showVideoFilter) videoFilterR else FocusRequester.Cancel
+                     },
+                 onClick = { onClick(autoCmSkipR); onAutoCmSkip() }
+             )
+         }
++
++        if (showVideoFilter) SettingsSection("録画再生 (DVR)") {
++            SettingItem(
++                title = VideoFilterPrefs.TITLE,
++                value = VideoFilterPrefs.default(LocalContext.current).label,
++                icon = Icons.Default.Tune,
++                modifier = Modifier
++                    .focusRequester(videoFilterR)
++                    .focusProperties {
++                        left = sidebarR
++                        up = autoCmSkipR
++                        down = FocusRequester.Cancel
++                    },
++                onClick = { onClick(videoFilterR); onVideoFilter() }
++            )
++        }
+     }
+ }
+ 
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/setting/SettingScreen.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/setting/SettingScreen.kt
+index 036a3a8..a1a6980 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/setting/SettingScreen.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/setting/SettingScreen.kt
+@@ -22,6 +22,7 @@ import androidx.compose.ui.focus.onFocusChanged
+ import androidx.compose.ui.input.key.KeyEventType
+ import androidx.compose.ui.input.key.onKeyEvent
+ import androidx.compose.ui.input.key.type
++import kr.dcmys.komorebi.video.VideoFilterPrefs
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.dp
+@@ -719,6 +720,14 @@ fun SettingsScreen(
+                                         )
+                                     }
+                                 }
++                            },
++                            showVideoFilter = prefs.backendType == "IPTV",
++                            onVideoFilter = {
++                                uiState.activeDialog = SettingDialogState.Selection(
++                                    VideoFilterPrefs.TITLE,
++                                    VideoFilterPrefs.options,
++                                    VideoFilterPrefs.default(context).name
++                                ) { VideoFilterPrefs.setDefault(context, it) }
+                             }
+                         ) { uiState.restoreFocusRequester = it; uiState.restoreCategoryIndex = 2 }
+ 
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerManager.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerManager.kt
+index 15820cd..3a43e75 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerManager.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerManager.kt
+@@ -64,6 +64,9 @@ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.delay
+ import kr.dcmys.komorebi.iptv.IptvPlayback
+ import kotlinx.coroutines.launch
++import kr.dcmys.komorebi.iptv.isIptvBackend
++import kr.dcmys.komorebi.video.KomorebiRenderersFactory
++import kr.dcmys.komorebi.video.VideoFilterPrefs
+ import java.util.concurrent.atomic.AtomicLong
+ import java.util.concurrent.atomic.AtomicReference
+ 
+@@ -212,7 +215,7 @@ fun rememberManagedExoPlayer(
+     }
+ 
+     val exoPlayer = remember {
+-        val renderersFactory = DefaultRenderersFactory(context).apply {
++        val renderersFactory = (if (isIptvBackend(backendType)) KomorebiRenderersFactory(context, VideoFilterPrefs.resolve(context, program?.id)) else DefaultRenderersFactory(context)).apply {
+             setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+             setEnableDecoderFallback(true)
+         }
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerScreen.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerScreen.kt
+index 22955db..05a8fb0 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerScreen.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerScreen.kt
+@@ -56,6 +56,7 @@ import java.util.UUID
+ import kr.dcmys.komorebi.iptv.IptvPlayback
+ import kr.dcmys.komorebi.platform.wideVideoArea
+ import kr.dcmys.komorebi.platform.windowMatchesAspect
++import kr.dcmys.komorebi.video.rememberVideoFilterMenu
+ 
+ private const val TAG = "VideoPlayerScreen"
+ private val PLAYER_CONTROLS_SUBTITLE_OFFSET = 96.dp
+@@ -362,6 +363,7 @@ fun VideoPlayerScreen(
+             onBackPressed()
+         }
+     )
++    val videoFilterMenu = rememberVideoFilterMenu(exoPlayer, program.id, isIptvDvr())
+ 
+     // ★ 修正: 以前は remember(vs, exoPlayer) でメモ化していたが、isEdcbDirect/isOffsetBasedStream
+     // (どちらも非同期に確定する値)がキーに含まれておらず、アプリ起動直後の読み込み中の一瞬に
+@@ -955,6 +957,7 @@ fun VideoPlayerScreen(
+                             "自動CMスキップ: ${if (vs.isAutoCmSkipEnabled) "ON" else "OFF"}"
+                         )
+                     },
++                    videoFilter = videoFilterMenu,
+                     onClose = { isModernSettingsOpen = false }
+                 )
+             }
+@@ -1086,6 +1089,7 @@ fun VideoPlayerScreen(
+                             "自動CMスキップ: ${if (vs.isAutoCmSkipEnabled) "ON" else "OFF"}"
+                         )
+                     },
++                    videoFilter = videoFilterMenu,
+                 )
+             }
+ 
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerSubMenu.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerSubMenu.kt
+index 5cdd63c..ca35521 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerSubMenu.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerSubMenu.kt
+@@ -21,6 +21,8 @@ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.foundation.verticalScroll
++import kr.dcmys.komorebi.video.VideoFilterMenuState
++import kr.dcmys.komorebi.video.VideoFilterPrefs
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.filled.*
+ import androidx.compose.runtime.*
+@@ -104,7 +106,8 @@ fun VideoTopSubMenuUI(
+     isQualitySupported: Boolean = true,
+     isCommentSupported: Boolean = true,
+     isSubtitleSupported: Boolean = true,
+-    isAutoCmSkipSupported: Boolean = true
++    isAutoCmSkipSupported: Boolean = true,
++    videoFilter: VideoFilterMenuState? = null
+ ) {
+     val colors = KomorebiTheme.colors
+     var selectedCategory by remember { mutableStateOf<SubMenuCategory?>(null) }
+@@ -229,6 +232,15 @@ fun VideoTopSubMenuUI(
+                     enabled = isAutoCmSkipSupported // ★ 適用
+                 )
+ 
++                if (videoFilter != null) VideoMenuTileItem(
++                    title = VideoFilterPrefs.TITLE,
++                    icon = Icons.Default.Tune,
++                    subtitle = videoFilter.label,
++                    onClick = videoFilter.onToggle,
++                    modifier = Modifier.focusProperties { down = FocusRequester.Cancel },
++                    contentColor = colors.textPrimary,
++                    enabled = true
++                )
+                 VideoMenuTileItem(
+                     title = "実況コメント",
+                     icon = Icons.Default.Chat,
+@@ -406,6 +418,7 @@ fun AnimatedVisibilityScope.ModernVideoSettingsOverlay(
+     isCommentSupported: Boolean = true,
+     isSubtitleSupported: Boolean = true,
+     isAutoCmSkipSupported: Boolean = true,
++    videoFilter: VideoFilterMenuState? = null,
+     onClose: () -> Unit
+ ) {
+     val colors = KomorebiTheme.colors
+@@ -556,6 +569,13 @@ fun AnimatedVisibilityScope.ModernVideoSettingsOverlay(
+                             highlight = isLCropEnabled,
+                             enabled = true
+                         )
++                        if (videoFilter != null) ModernSettingRow(
++                            title = VideoFilterPrefs.TITLE,
++                            value = videoFilter.label,
++                            icon = Icons.Default.Tune,
++                            onClick = videoFilter.onToggle,
++                            enabled = true
++                        )
+                     }
+                 } else if (category == SubMenuCategory.QUALITY) {
+                     Column(
+diff --git a/app/src/main/java/kr/dcmys/komorebi/video/FfmpegMpeg2Decoder.kt b/app/src/main/java/kr/dcmys/komorebi/video/FfmpegMpeg2Decoder.kt
+new file mode 100644
+index 0000000..b14989f
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/video/FfmpegMpeg2Decoder.kt
+@@ -0,0 +1,233 @@
++package kr.dcmys.komorebi.video
++
++import androidx.media3.common.C
++import androidx.media3.common.Format
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.decoder.Decoder
++import androidx.media3.decoder.DecoderException
++import androidx.media3.decoder.DecoderInputBuffer
++import androidx.media3.decoder.VideoDecoderOutputBuffer
++import androidx.media3.exoplayer.DecoderCounters
++
++@UnstableApi
++class FfmpegVideoDecoderException(message: String) : DecoderException(message)
++
++@UnstableApi
++internal class NativeFrameBuffer(owner: Owner<VideoDecoderOutputBuffer>) : VideoDecoderOutputBuffer(owner) {
++    var nativeFrame = 0L
++}
++
++/**
++ * media3 [Decoder] over the native ffmpeg decoder + filter graph. The native side owns the decode
++ * thread and bounded packet/frame queues, so every method here is non-blocking.
++ *
++ * Output is N:M with respect to input (bwdif emits one frame per field, IVTC drops frames), while
++ * DecoderVideoRenderer assumes one output per queued input when it counts buffers in the codec.
++ * [InputAccounting] maps each output to the inputs it consumed and reports the difference through
++ * [VideoDecoderOutputBuffer.skippedOutputBufferCount].
++ */
++@UnstableApi
++internal class FfmpegMpeg2Decoder(
++    format: Format,
++    mode: VideoFilterMode,
++    private val counters: () -> DecoderCounters,
++) : Decoder<DecoderInputBuffer, VideoDecoderOutputBuffer, FfmpegVideoDecoderException> {
++
++    val handle: Long
++    private val inputBuffer = DecoderInputBuffer(DecoderInputBuffer.BUFFER_REPLACEMENT_MODE_DIRECT)
++    private var pendingInput = false
++    private var serial = 0
++    private var flushPending = true
++    private var outputStartTimeUs = C.TIME_UNSET
++    private val accounting = InputAccounting()
++    private var carriedSkips = 0
++    private val frameInfo = LongArray(4)
++    private val lock = Any()
++    private val outstanding = HashSet<NativeFrameBuffer>()
++    private val pool = ArrayDeque<NativeFrameBuffer>()
++    private var released = false
++    private var infoVersion = Int.MIN_VALUE
++
++    @Volatile var outputMode: Int = C.VIDEO_OUTPUT_MODE_NONE
++
++    val sequenceInfo: Mpeg2SequenceInfo? = Mpeg2SequenceInfo.parse(format.initializationData.firstOrNull())
++
++    init {
++        val info = sequenceInfo
++        handle = NativeVideo.nativeOpen(
++            format.initializationData.firstOrNull(),
++            info?.width ?: format.width.coerceAtLeast(0),
++            info?.height ?: format.height.coerceAtLeast(0),
++            format.pixelWidthHeightRatio,
++            info?.frameRateNum ?: 0,
++            info?.frameRateDen ?: 0,
++            info?.avFieldOrder ?: 0,
++            mode.nativeValue,
++            true,
++        )
++        if (handle == 0L) throw FfmpegVideoDecoderException("Failed to open the ffmpeg MPEG-2 decoder")
++    }
++
++    override fun getName(): String = "ffmpeg-mpeg2"
++
++    override fun setOutputStartTimeUs(outputStartTimeUs: Long) {
++        this.outputStartTimeUs = outputStartTimeUs
++        applyPendingFlush()
++    }
++
++    override fun dequeueInputBuffer(): DecoderInputBuffer? {
++        applyPendingFlush()
++        if (pendingInput && !pushPendingInput()) return null
++        inputBuffer.clear()
++        return inputBuffer
++    }
++
++    override fun queueInputBuffer(inputBuffer: DecoderInputBuffer) {
++        check(inputBuffer === this.inputBuffer)
++        applyPendingFlush()
++        pendingInput = true
++        pushPendingInput()
++    }
++
++    override fun dequeueOutputBuffer(): VideoDecoderOutputBuffer? {
++        applyPendingFlush()
++        if (pendingInput) pushPendingInput()
++        while (true) {
++            when (NativeVideo.nativeDequeueFrame(handle, serial, frameInfo)) {
++                NativeVideo.DEQUEUE_FRAME -> {
++                    val frame = frameInfo[0]
++                    val timeUs = frameInfo[1]
++                    val consumed = accounting.consumedBy(timeUs)
++                    if (outputStartTimeUs != C.TIME_UNSET && timeUs < outputStartTimeUs) {
++                        NativeVideo.nativeReleaseFrame(handle, frame)
++                        carriedSkips += consumed
++                        continue
++                    }
++                    val buffer = obtainBuffer()
++                    buffer.init(timeUs, if (outputMode == C.VIDEO_OUTPUT_MODE_SURFACE_YUV) outputMode else C.VIDEO_OUTPUT_MODE_NONE, null)
++                    buffer.initForPrivateFrame(frameInfo[2].toInt(), frameInfo[3].toInt())
++                    buffer.nativeFrame = frame
++                    // The renderer subtracts skipped + 1 from its in-codec count for this buffer.
++                    val skipped = carriedSkips + consumed - 1
++                    carriedSkips = 0
++                    buffer.skippedOutputBufferCount = skipped
++                    // An extra output (e.g. the second field) yields -1; the renderer adds it to
++                    // its skipped counter, so cancel that out to keep the statistic meaningful.
++                    if (skipped < 0) counters().skippedOutputBufferCount -= skipped
++                    return buffer
++                }
++                NativeVideo.DEQUEUE_END_OF_STREAM -> {
++                    val buffer = obtainBuffer()
++                    buffer.addFlag(C.BUFFER_FLAG_END_OF_STREAM)
++                    return buffer
++                }
++                else -> {
++                    val error = NativeVideo.nativeLastError(handle)
++                    if (error != 0) throw FfmpegVideoDecoderException("ffmpeg video decode thread stopped: $error")
++                    return null
++                }
++            }
++        }
++    }
++
++    override fun flush() {
++        serial++
++        flushPending = true
++        pendingInput = false
++        accounting.clear()
++        carriedSkips = 0
++    }
++
++    override fun release() {
++        synchronized(lock) {
++            released = true
++            outstanding.forEach { freeFrame(it) }
++            outstanding.clear()
++            pool.clear()
++        }
++        NativeVideo.nativeClose(handle)
++    }
++
++    fun setFilterMode(mode: VideoFilterMode) {
++        NativeVideo.nativeSetMode(handle, mode.nativeValue)
++    }
++
++    /** Returns (decoderName, hardware, effectiveNativeMode, backend) when it changed since the last call. */
++    fun pollInfo(): List<String>? {
++        val version = NativeVideo.nativeInfoVersion(handle)
++        if (version == infoVersion) return null
++        infoVersion = version
++        return NativeVideo.nativeInfo(handle)?.split('\t')?.takeIf { it.size == 4 }
++    }
++
++    private fun applyPendingFlush() {
++        if (!flushPending) return
++        flushPending = false
++        NativeVideo.nativeFlush(handle, serial, outputStartTimeUs != C.TIME_UNSET, outputStartTimeUs)
++    }
++
++    private fun pushPendingInput(): Boolean {
++        val buffer = inputBuffer
++        val result = if (buffer.isEndOfStream) {
++            NativeVideo.nativeQueueEndOfStream(handle, serial)
++        } else {
++            val data = checkNotNull(buffer.data)
++            NativeVideo.nativeQueuePacket(
++                handle, data, data.position(), data.remaining(), buffer.timeUs, buffer.isKeyFrame, serial,
++            )
++        }
++        return when (result) {
++            NativeVideo.QUEUE_OK -> {
++                if (!buffer.isEndOfStream) accounting.add(buffer.timeUs)
++                pendingInput = false
++                true
++            }
++            NativeVideo.QUEUE_FULL -> false
++            else -> throw FfmpegVideoDecoderException("Failed to queue video packet")
++        }
++    }
++
++    private fun obtainBuffer(): NativeFrameBuffer = synchronized(lock) {
++        val buffer = pool.removeLastOrNull() ?: NativeFrameBuffer(::releaseOutputBuffer)
++        outstanding.add(buffer)
++        buffer
++    }
++
++    private fun releaseOutputBuffer(buffer: VideoDecoderOutputBuffer) {
++        buffer as NativeFrameBuffer
++        synchronized(lock) {
++            if (!outstanding.remove(buffer)) return
++            freeFrame(buffer)
++            buffer.clear()
++            if (!released) pool.addLast(buffer)
++        }
++    }
++
++    private fun freeFrame(buffer: NativeFrameBuffer) {
++        if (buffer.nativeFrame != 0L) NativeVideo.nativeReleaseFrame(handle, buffer.nativeFrame)
++        buffer.nativeFrame = 0L
++    }
++}
++
++/** Timestamps of queued inputs not yet represented by an output frame. */
++internal class InputAccounting {
++    private val pending = java.util.PriorityQueue<Long>()
++
++    fun add(timeUs: Long) {
++        pending.add(timeUs)
++    }
++
++    /** Number of queued inputs presented at or before [outputTimeUs]; they are consumed by that output. */
++    fun consumedBy(outputTimeUs: Long): Int {
++        var count = 0
++        while (pending.isNotEmpty() && pending.peek()!! <= outputTimeUs) {
++            pending.poll()
++            count++
++        }
++        return count
++    }
++
++    fun clear() = pending.clear()
++
++    val size: Int get() = pending.size
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/video/FfmpegMpeg2VideoRenderer.kt b/app/src/main/java/kr/dcmys/komorebi/video/FfmpegMpeg2VideoRenderer.kt
+new file mode 100644
+index 0000000..6d2b116
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/video/FfmpegMpeg2VideoRenderer.kt
+@@ -0,0 +1,205 @@
++package kr.dcmys.komorebi.video
++
++import android.os.Handler
++import android.util.Log
++import android.view.Surface
++import androidx.media3.common.C
++import androidx.media3.common.Format
++import androidx.media3.common.MimeTypes
++import androidx.media3.common.VideoSize
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.decoder.CryptoConfig
++import androidx.media3.decoder.Decoder
++import androidx.media3.decoder.DecoderInputBuffer
++import androidx.media3.decoder.VideoDecoderOutputBuffer
++import androidx.media3.exoplayer.DecoderCounters
++import androidx.media3.exoplayer.DecoderReuseEvaluation
++import androidx.media3.exoplayer.FormatHolder
++import androidx.media3.exoplayer.Renderer
++import androidx.media3.exoplayer.RendererCapabilities
++import androidx.media3.exoplayer.video.DecoderVideoRenderer
++import androidx.media3.exoplayer.video.VideoRendererEventListener
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/**
++ * Decodes `video/mpeg2` with ffmpeg (MediaCodec first, software fallback) and runs aribplayer's
++ * IVTC / deinterlace filter graph, rendering YV12 into the output Surface.
++ */
++@UnstableApi
++class FfmpegMpeg2VideoRenderer private constructor(
++    allowedJoiningTimeMs: Long,
++    eventHandler: Handler?,
++    eventListener: VideoRendererEventListener?,
++    maxDroppedFramesToNotify: Int,
++    initialMode: VideoFilterMode,
++    private val aspect: AspectState,
++) : DecoderVideoRenderer(
++    allowedJoiningTimeMs,
++    eventHandler,
++    eventListener?.let { AspectFixingListener(it, aspect) },
++    maxDroppedFramesToNotify,
++) {
++    constructor(
++        allowedJoiningTimeMs: Long,
++        eventHandler: Handler?,
++        eventListener: VideoRendererEventListener?,
++        maxDroppedFramesToNotify: Int,
++        initialMode: VideoFilterMode = VideoFilterMode.AUTO,
++    ) : this(allowedJoiningTimeMs, eventHandler, eventListener, maxDroppedFramesToNotify, initialMode, AspectState())
++
++    @Volatile private var filterMode = initialMode
++    private var decoder: FfmpegMpeg2Decoder? = null
++    private var surfaceOutput = 0L
++    private var loggedRenderFailure = false
++
++    private val _pipelineInfo = MutableStateFlow<VideoPipelineInfo?>(null)
++    val pipelineInfo: StateFlow<VideoPipelineInfo?> = _pipelineInfo.asStateFlow()
++
++    override fun getName(): String = TAG
++
++    override fun supportsFormat(format: Format): Int {
++        if (!MimeTypes.VIDEO_MPEG2.equals(format.sampleMimeType, ignoreCase = true)) {
++            return RendererCapabilities.create(C.FORMAT_UNSUPPORTED_TYPE)
++        }
++        if (!NativeVideo.isAvailable) return RendererCapabilities.create(C.FORMAT_UNSUPPORTED_SUBTYPE)
++        return RendererCapabilities.create(
++            C.FORMAT_HANDLED,
++            RendererCapabilities.ADAPTIVE_SEAMLESS,
++            RendererCapabilities.TUNNELING_NOT_SUPPORTED,
++        )
++    }
++
++    override fun createDecoder(
++        format: Format,
++        cryptoConfig: CryptoConfig?,
++    ): Decoder<DecoderInputBuffer, VideoDecoderOutputBuffer, FfmpegVideoDecoderException> {
++        val created = FfmpegMpeg2Decoder(format, filterMode) { decoderCounters }
++        Log.i(TAG, "decoder created ${format.width}x${format.height} par=${format.pixelWidthHeightRatio} " +
++            "sequence=${created.sequenceInfo} mode=$filterMode")
++        decoder = created
++        return created
++    }
++
++    override fun renderOutputBufferToSurface(outputBuffer: VideoDecoderOutputBuffer, surface: Surface) {
++        val frame = (outputBuffer as NativeFrameBuffer).nativeFrame
++        if (surfaceOutput == 0L) surfaceOutput = NativeVideo.nativeSurfaceCreate()
++        val handle = decoder?.handle ?: 0L
++        if (!NativeVideo.nativeSurfaceRender(surfaceOutput, surface, handle, frame) && !loggedRenderFailure) {
++            loggedRenderFailure = true
++            Log.w(TAG, "failed to render a frame to the surface")
++        }
++        outputBuffer.release()
++        pollPipelineInfo()
++    }
++
++    override fun setDecoderOutputMode(outputMode: Int) {
++        decoder?.outputMode = outputMode
++    }
++
++    override fun canReuseDecoder(decoderName: String, oldFormat: Format, newFormat: Format): DecoderReuseEvaluation =
++        DecoderReuseEvaluation(
++            decoderName, oldFormat, newFormat,
++            DecoderReuseEvaluation.REUSE_RESULT_YES_WITHOUT_RECONFIGURATION, 0,
++        )
++
++    override fun onInputFormatChanged(formatHolder: FormatHolder) {
++        formatHolder.format?.let { aspect.pixelWidthHeightRatio = it.pixelWidthHeightRatio }
++        super.onInputFormatChanged(formatHolder)
++    }
++
++    override fun onQueueInputBuffer(buffer: DecoderInputBuffer) {
++        super.onQueueInputBuffer(buffer)
++        pollPipelineInfo()
++    }
++
++    override fun releaseDecoder() {
++        decoder?.let { logCounters("released", decoderCounters) }
++        if (surfaceOutput != 0L) NativeVideo.nativeSurfaceDrain(surfaceOutput)
++        super.releaseDecoder()
++        decoder = null
++    }
++
++    override fun onDisabled() {
++        super.onDisabled()
++        if (surfaceOutput != 0L) {
++            NativeVideo.nativeSurfaceRelease(surfaceOutput)
++            surfaceOutput = 0L
++        }
++    }
++
++    override fun handleMessage(messageType: Int, message: Any?) {
++        when (messageType) {
++            MSG_SET_FILTER_MODE -> {
++                val mode = message as? VideoFilterMode ?: return
++                filterMode = mode
++                decoder?.setFilterMode(mode)
++                _pipelineInfo.value = _pipelineInfo.value?.copy(requestedMode = mode)
++            }
++            Renderer.MSG_SET_VIDEO_OUTPUT -> {
++                super.handleMessage(messageType, message)
++                if (message !is Surface && surfaceOutput != 0L) NativeVideo.nativeSurfaceDetach(surfaceOutput)
++            }
++            else -> super.handleMessage(messageType, message)
++        }
++    }
++
++    private fun pollPipelineInfo() {
++        val fields = decoder?.pollInfo() ?: return
++        val backend = when (fields[3]) {
++            "opencl" -> "opencl"
++            "software" -> "cpu"
++            else -> "none"
++        }
++        val info = VideoPipelineInfo(
++            decoderName = fields[0],
++            hardware = fields[1] == "1",
++            requestedMode = filterMode,
++            effectiveMode = fields[2].toIntOrNull()?.let { VideoFilterMode.fromNative(it) },
++            filterBackend = backend,
++        )
++        if (info != _pipelineInfo.value) {
++            Log.i(TAG, "pipeline decoder=${info.decoderName} hw=${info.hardware} requested=${info.requestedMode} " +
++                "effective=${info.effectiveMode} filter=${info.filterBackend}")
++            _pipelineInfo.value = info
++        }
++    }
++
++    private fun logCounters(event: String, c: DecoderCounters) {
++        c.ensureUpdated()
++        Log.i(TAG, "$event: queued=${c.queuedInputBufferCount} rendered=${c.renderedOutputBufferCount} " +
++            "skipped=${c.skippedOutputBufferCount} dropped=${c.droppedBufferCount} " +
++            "droppedToKeyframe=${c.droppedToKeyframeCount} maxConsecutiveDropped=${c.maxConsecutiveDroppedBufferCount}")
++    }
++
++    internal class AspectState {
++        @Volatile var pixelWidthHeightRatio = 1f
++    }
++
++    /** DecoderVideoRenderer reports VideoSize without the pixel aspect ratio; restore the Format's like MediaCodecVideoRenderer does. */
++    private class AspectFixingListener(
++        private val delegate: VideoRendererEventListener,
++        private val aspect: AspectState,
++    ) : VideoRendererEventListener {
++        override fun onVideoEnabled(counters: DecoderCounters) = delegate.onVideoEnabled(counters)
++        override fun onVideoDecoderInitialized(decoderName: String, initializedTimestampMs: Long, initializationDurationMs: Long) =
++            delegate.onVideoDecoderInitialized(decoderName, initializedTimestampMs, initializationDurationMs)
++        override fun onVideoInputFormatChanged(format: Format, decoderReuseEvaluation: DecoderReuseEvaluation?) =
++            delegate.onVideoInputFormatChanged(format, decoderReuseEvaluation)
++        override fun onDroppedFrames(count: Int, elapsedMs: Long) = delegate.onDroppedFrames(count, elapsedMs)
++        override fun onVideoFrameProcessingOffset(totalProcessingOffsetUs: Long, frameCount: Int) =
++            delegate.onVideoFrameProcessingOffset(totalProcessingOffsetUs, frameCount)
++        override fun onVideoSizeChanged(videoSize: VideoSize) =
++            delegate.onVideoSizeChanged(VideoSize(videoSize.width, videoSize.height, aspect.pixelWidthHeightRatio))
++        override fun onRenderedFirstFrame(output: Any, renderTimeMs: Long) = delegate.onRenderedFirstFrame(output, renderTimeMs)
++        override fun onVideoDecoderReleased(decoderName: String) = delegate.onVideoDecoderReleased(decoderName)
++        override fun onVideoDisabled(counters: DecoderCounters) = delegate.onVideoDisabled(counters)
++        override fun onVideoCodecError(videoCodecError: Exception) = delegate.onVideoCodecError(videoCodecError)
++    }
++
++    companion object {
++        private const val TAG = "FfmpegMpeg2Renderer"
++        internal const val MSG_SET_FILTER_MODE = Renderer.MSG_CUSTOM_BASE + 0x4b56
++    }
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/video/KomorebiRenderersFactory.kt b/app/src/main/java/kr/dcmys/komorebi/video/KomorebiRenderersFactory.kt
+new file mode 100644
+index 0000000..5d8c741
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/video/KomorebiRenderersFactory.kt
+@@ -0,0 +1,56 @@
++package kr.dcmys.komorebi.video
++
++import android.content.Context
++import android.os.Handler
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.DefaultRenderersFactory
++import androidx.media3.exoplayer.ExoPlayer
++import androidx.media3.exoplayer.Renderer
++import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
++import androidx.media3.exoplayer.video.VideoRendererEventListener
++import kotlinx.coroutines.flow.StateFlow
++
++/** [DefaultRenderersFactory] that tries [FfmpegMpeg2VideoRenderer] before the MediaCodec video renderer. */
++@UnstableApi
++class KomorebiRenderersFactory(
++    context: Context,
++    private val initialFilterMode: VideoFilterMode = VideoFilterMode.AUTO,
++) : DefaultRenderersFactory(context) {
++
++    override fun buildVideoRenderers(
++        context: Context,
++        extensionRendererMode: Int,
++        mediaCodecSelector: MediaCodecSelector,
++        enableDecoderFallback: Boolean,
++        eventHandler: Handler,
++        eventListener: VideoRendererEventListener,
++        allowedVideoJoiningTimeMs: Long,
++        out: ArrayList<Renderer>,
++    ) {
++        out.add(
++            FfmpegMpeg2VideoRenderer(
++                allowedVideoJoiningTimeMs, eventHandler, eventListener,
++                MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY, initialFilterMode,
++            ),
++        )
++        super.buildVideoRenderers(
++            context, extensionRendererMode, mediaCodecSelector, enableDecoderFallback,
++            eventHandler, eventListener, allowedVideoJoiningTimeMs, out,
++        )
++    }
++}
++
++@UnstableApi
++private fun ExoPlayer.ffmpegVideoRenderer(): FfmpegMpeg2VideoRenderer? =
++    (0 until rendererCount).firstNotNullOfOrNull { getRenderer(it) as? FfmpegMpeg2VideoRenderer }
++
++/** Switches the ffmpeg renderer's filter mode; also used for decoders created after later seeks. No-op without that renderer. */
++@UnstableApi
++fun ExoPlayer.setVideoFilterMode(mode: VideoFilterMode) {
++    val renderer = ffmpegVideoRenderer() ?: return
++    createMessage(renderer).setType(FfmpegMpeg2VideoRenderer.MSG_SET_FILTER_MODE).setPayload(mode).send()
++}
++
++/** What the ffmpeg renderer is running, or null when this player has no such renderer. */
++@UnstableApi
++fun ExoPlayer.videoPipelineInfo(): StateFlow<VideoPipelineInfo?>? = ffmpegVideoRenderer()?.pipelineInfo
+diff --git a/app/src/main/java/kr/dcmys/komorebi/video/Mpeg2SequenceInfo.kt b/app/src/main/java/kr/dcmys/komorebi/video/Mpeg2SequenceInfo.kt
+new file mode 100644
+index 0000000..b4d22d4
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/video/Mpeg2SequenceInfo.kt
+@@ -0,0 +1,63 @@
++package kr.dcmys.komorebi.video
++
++/** Fields of an MPEG-2 sequence header (+ sequence extension) as found in media3's `video/mpeg2` initialization data. */
++data class Mpeg2SequenceInfo(
++    val width: Int,
++    val height: Int,
++    val frameRateNum: Int,
++    val frameRateDen: Int,
++    /** `progressive_sequence`, or null when there is no sequence extension (MPEG-1 style header). */
++    val progressiveSequence: Boolean?,
++) {
++    /** libavutil AVFieldOrder: AV_FIELD_UNKNOWN(0), AV_FIELD_PROGRESSIVE(1), AV_FIELD_TT(2). */
++    val avFieldOrder: Int
++        get() = when (progressiveSequence) {
++            true -> 1
++            false -> 2
++            null -> 0
++        }
++
++    companion object {
++        private val FRAME_RATES = arrayOf(
++            24000 to 1001, 24 to 1, 25 to 1, 30000 to 1001, 30 to 1, 50 to 1, 60000 to 1001, 60 to 1,
++        )
++
++        fun parse(data: ByteArray?): Mpeg2SequenceInfo? {
++            if (data == null) return null
++            val header = findStartCode(data, 0xB3, 0) ?: return null
++            if (header + 8 > data.size) return null
++            val b = { i: Int -> data[header + i].toInt() and 0xFF }
++            val width = (b(4) shl 4) or (b(5) shr 4)
++            val height = ((b(5) and 0x0F) shl 8) or b(6)
++            var (num, den) = FRAME_RATES.getOrNull((b(7) and 0x0F) - 1) ?: (0 to 0)
++
++            var progressive: Boolean? = null
++            var search = header + 4
++            while (true) {
++                val ext = findStartCode(data, 0xB5, search) ?: break
++                if (ext + 10 <= data.size && (data[ext + 4].toInt() and 0xF0) == 0x10) {
++                    val e = { i: Int -> data[ext + i].toInt() and 0xFF }
++                    progressive = (e(5) and 0x08) != 0
++                    val n = (e(9) shr 5) and 0x03
++                    val d = e(9) and 0x1F
++                    if (num > 0) {
++                        num *= n + 1
++                        den *= d + 1
++                    }
++                    break
++                }
++                search = ext + 4
++            }
++            return Mpeg2SequenceInfo(width, height, num, den, progressive)
++        }
++
++        private fun findStartCode(data: ByteArray, code: Int, from: Int): Int? {
++            for (i in from until data.size - 3) {
++                if (data[i].toInt() == 0 && data[i + 1].toInt() == 0 && data[i + 2].toInt() == 1 &&
++                    (data[i + 3].toInt() and 0xFF) == code
++                ) return i
++            }
++            return null
++        }
++    }
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/video/NativeVideo.kt b/app/src/main/java/kr/dcmys/komorebi/video/NativeVideo.kt
+new file mode 100644
+index 0000000..81dd738
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/video/NativeVideo.kt
+@@ -0,0 +1,75 @@
++package kr.dcmys.komorebi.video
++
++import android.util.Log
++import android.view.Surface
++import java.nio.ByteBuffer
++
++internal object NativeVideo {
++    private const val TAG = "KomorebiVideo"
++
++    const val QUEUE_OK = 0
++    const val QUEUE_FULL = 1
++
++    const val DEQUEUE_NONE = 0
++    const val DEQUEUE_FRAME = 1
++    const val DEQUEUE_END_OF_STREAM = 2
++
++    val isAvailable: Boolean by lazy {
++        try {
++            System.loadLibrary("komorebi-video")
++            nativeHasDecoder()
++        } catch (e: Throwable) {
++            Log.w(TAG, "ffmpeg video renderer unavailable", e)
++            false
++        }
++    }
++
++    external fun nativeHasDecoder(): Boolean
++
++    external fun nativeOpen(
++        extradata: ByteArray?,
++        width: Int,
++        height: Int,
++        pixelWidthHeightRatio: Float,
++        frameRateNum: Int,
++        frameRateDen: Int,
++        fieldOrder: Int,
++        mode: Int,
++        preferMediaCodec: Boolean,
++    ): Long
++
++    external fun nativeQueuePacket(
++        handle: Long, buffer: ByteBuffer, offset: Int, size: Int, timeUs: Long, keyFrame: Boolean, serial: Int,
++    ): Int
++
++    external fun nativeQueueEndOfStream(handle: Long, serial: Int): Int
++
++    external fun nativeFlush(handle: Long, serial: Int, hasStartTime: Boolean, startTimeUs: Long)
++
++    /** Fills [out] with {AVFrame*, timeUs, width, height} when returning [DEQUEUE_FRAME]. */
++    external fun nativeDequeueFrame(handle: Long, serial: Int, out: LongArray): Int
++
++    external fun nativeReleaseFrame(handle: Long, frame: Long)
++
++    external fun nativeSetMode(handle: Long, mode: Int)
++
++    /** 0 while the decode thread runs, otherwise the AVERROR that stopped it. */
++    external fun nativeLastError(handle: Long): Int
++
++    external fun nativeInfoVersion(handle: Long): Int
++
++    /** "decoderName\thardware(0|1)\teffectiveMode\tbackend" */
++    external fun nativeInfo(handle: Long): String?
++
++    external fun nativeClose(handle: Long)
++
++    external fun nativeSurfaceCreate(): Long
++
++    external fun nativeSurfaceRender(output: Long, surface: Surface, handle: Long, frame: Long): Boolean
++
++    external fun nativeSurfaceDrain(output: Long)
++
++    external fun nativeSurfaceDetach(output: Long)
++
++    external fun nativeSurfaceRelease(output: Long)
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/video/VideoFilterMode.kt b/app/src/main/java/kr/dcmys/komorebi/video/VideoFilterMode.kt
+new file mode 100644
+index 0000000..34c590f
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/video/VideoFilterMode.kt
+@@ -0,0 +1,25 @@
++package kr.dcmys.komorebi.video
++
++enum class VideoFilterMode(val nativeValue: Int) {
++    AUTO(1),
++    IVTC(2),
++    DEINTERLACE(3),
++    OFF(0);
++
++    companion object {
++        fun fromNative(value: Int): VideoFilterMode? = entries.firstOrNull { it.nativeValue == value }
++    }
++}
++
++/**
++ * What the ffmpeg video pipeline is actually running.
++ * [hardware] means the decoder is MediaCodec-backed (`mpeg2_mediacodec`).
++ * [filterBackend] is "opencl", "cpu" or "none" (no filter, or the filter graph failed and frames bypass it).
++ */
++data class VideoPipelineInfo(
++    val decoderName: String,
++    val hardware: Boolean,
++    val requestedMode: VideoFilterMode,
++    val effectiveMode: VideoFilterMode?,
++    val filterBackend: String,
++)
+diff --git a/app/src/main/java/kr/dcmys/komorebi/video/VideoFilterPrefs.kt b/app/src/main/java/kr/dcmys/komorebi/video/VideoFilterPrefs.kt
+new file mode 100644
+index 0000000..ae25dba
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/video/VideoFilterPrefs.kt
+@@ -0,0 +1,88 @@
++package kr.dcmys.komorebi.video
++
++import android.content.Context
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.platform.LocalContext
++import androidx.media3.exoplayer.ExoPlayer
++
++val VideoFilterMode.label: String
++    get() = when (this) {
++        VideoFilterMode.AUTO -> "自動"
++        VideoFilterMode.IVTC -> "フィルム (IVTC)"
++        VideoFilterMode.DEINTERLACE -> "インターレース解除"
++        VideoFilterMode.OFF -> "オフ"
++    }
++
++/** The per-file value is null when the file follows the app-wide default. */
++object VideoFilterPrefs {
++    const val TITLE = "映像フィルタ"
++
++    private const val FILE = "kr.dcmys.komorebi.video_filter"
++    private const val KEY_DEFAULT = "default"
++    private const val KEY_FILE_PREFIX = "file:"
++
++    private var defaultState = mutableStateOf<VideoFilterMode?>(null)
++
++    val options: List<Pair<String, String>> = VideoFilterMode.entries.map { it.label to it.name }
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
++
++    private fun parse(name: String?): VideoFilterMode? =
++        VideoFilterMode.entries.firstOrNull { it.name == name }
++
++    fun default(context: Context): VideoFilterMode =
++        defaultState.value
++            ?: (parse(prefs(context).getString(KEY_DEFAULT, null)) ?: VideoFilterMode.AUTO)
++                .also { defaultState.value = it }
++
++    fun setDefault(context: Context, name: String) {
++        val mode = parse(name) ?: return
++        prefs(context).edit().putString(KEY_DEFAULT, mode.name).apply()
++        defaultState.value = mode
++    }
++
++    fun forFile(context: Context, programId: Int): VideoFilterMode? =
++        parse(prefs(context).getString(KEY_FILE_PREFIX + programId, null))
++
++    fun setForFile(context: Context, programId: Int, mode: VideoFilterMode?) {
++        prefs(context).edit().apply {
++            if (mode == null) remove(KEY_FILE_PREFIX + programId)
++            else putString(KEY_FILE_PREFIX + programId, mode.name)
++        }.apply()
++    }
++
++    fun resolve(context: Context, programId: Int?): VideoFilterMode =
++        programId?.let { forFile(context, it) } ?: default(context)
++
++    fun next(current: VideoFilterMode?): VideoFilterMode? {
++        val cycle = listOf(null) + VideoFilterMode.entries
++        return cycle[(cycle.indexOf(current) + 1) % cycle.size]
++    }
++}
++
++class VideoFilterMenuState(val label: String, val onToggle: () -> Unit)
++
++@Composable
++fun rememberVideoFilterMenu(player: ExoPlayer, programId: Int, enabled: Boolean): VideoFilterMenuState? {
++    if (!enabled) return null
++    val context = LocalContext.current
++    var choice by remember(programId) { mutableStateOf(VideoFilterPrefs.forFile(context, programId)) }
++    val default = VideoFilterPrefs.default(context)
++    LaunchedEffect(player, programId, choice, default) {
++        player.setVideoFilterMode(choice ?: default)
++    }
++    return VideoFilterMenuState(
++        label = choice?.label ?: "既定 (${default.label})",
++        onToggle = {
++            val next = VideoFilterPrefs.next(choice)
++            VideoFilterPrefs.setForFile(context, programId, next)
++            choice = next
++        },
++    )
++}
+diff --git a/app/src/test/java/kr/dcmys/komorebi/video/Mpeg2SequenceInfoTest.kt b/app/src/test/java/kr/dcmys/komorebi/video/Mpeg2SequenceInfoTest.kt
+new file mode 100644
+index 0000000..21f0822
+--- /dev/null
++++ b/app/src/test/java/kr/dcmys/komorebi/video/Mpeg2SequenceInfoTest.kt
+@@ -0,0 +1,82 @@
++package kr.dcmys.komorebi.video
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++class Mpeg2SequenceInfoTest {
++
++    private fun bytes(vararg values: Int) = ByteArray(values.size) { values[it].toByte() }
++
++    // 1440x1080, 16:9, 29.97 fps
++    private val sequenceHeader = intArrayOf(0x00, 0x00, 0x01, 0xB3, 0x5A, 0x04, 0x38, 0x34, 0xFF, 0xFF, 0xE0, 0x18)
++
++    private fun sequenceExtension(progressive: Boolean, n: Int = 0, d: Int = 0) = intArrayOf(
++        0x00, 0x00, 0x01, 0xB5,
++        0x14, if (progressive) 0x8A else 0x82, 0x00, 0x01, 0x00, (n shl 5) or d,
++    )
++
++    @Test
++    fun parsesInterlacedHeaderWithExtension() {
++        val info = Mpeg2SequenceInfo.parse(bytes(*sequenceHeader, *sequenceExtension(progressive = false)))!!
++        assertEquals(1440, info.width)
++        assertEquals(1080, info.height)
++        assertEquals(30000, info.frameRateNum)
++        assertEquals(1001, info.frameRateDen)
++        assertEquals(false, info.progressiveSequence)
++        assertEquals(2, info.avFieldOrder)
++    }
++
++    @Test
++    fun parsesProgressiveAndFrameRateExtension() {
++        val info = Mpeg2SequenceInfo.parse(bytes(*sequenceHeader, *sequenceExtension(progressive = true, n = 1, d = 0)))!!
++        assertEquals(true, info.progressiveSequence)
++        assertEquals(1, info.avFieldOrder)
++        assertEquals(60000, info.frameRateNum)
++        assertEquals(1001, info.frameRateDen)
++    }
++
++    @Test
++    fun headerWithoutExtensionHasUnknownFieldOrder() {
++        val info = Mpeg2SequenceInfo.parse(bytes(*sequenceHeader))!!
++        assertNull(info.progressiveSequence)
++        assertEquals(0, info.avFieldOrder)
++    }
++
++    @Test
++    fun rejectsDataWithoutSequenceHeader() {
++        assertNull(Mpeg2SequenceInfo.parse(bytes(0, 0, 1, 0x00, 1, 2, 3, 4, 5)))
++        assertNull(Mpeg2SequenceInfo.parse(null))
++    }
++}
++
++class InputAccountingTest {
++
++    @Test
++    fun oneOutputPerInputConsumesOne() {
++        val accounting = InputAccounting()
++        listOf(0L, 33_366L, 66_733L).forEach(accounting::add)
++        assertEquals(1, accounting.consumedBy(0L))
++        assertEquals(1, accounting.consumedBy(33_366L))
++        assertEquals(1, accounting.consumedBy(66_733L))
++    }
++
++    @Test
++    fun fieldRateOutputConsumesNothingForTheSecondField() {
++        val accounting = InputAccounting()
++        listOf(0L, 33_366L).forEach(accounting::add)
++        assertEquals(1, accounting.consumedBy(0L))
++        assertEquals(0, accounting.consumedBy(16_683L))
++        assertEquals(1, accounting.consumedBy(33_366L))
++        assertEquals(0, accounting.size)
++    }
++
++    @Test
++    fun droppedFramesAreConsumedByTheNextOutput() {
++        val accounting = InputAccounting()
++        // Reordered (decode-order) input timestamps.
++        listOf(100L, 0L, 33L, 66L, 200L).forEach(accounting::add)
++        assertEquals(4, accounting.consumedBy(100L))
++        assertEquals(1, accounting.size)
++    }
++}

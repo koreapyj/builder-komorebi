@@ -836,7 +836,7 @@ index 7ec316a..15820cd 100644
                  }
  
 diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerScreen.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerScreen.kt
-index 955ab1f..008294f 100644
+index ed55317..22955db 100644
 --- a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerScreen.kt
 +++ b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerScreen.kt
 @@ -53,6 +53,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
@@ -844,10 +844,10 @@ index 955ab1f..008294f 100644
  import kotlinx.coroutines.launch
  import java.util.UUID
 +import kr.dcmys.komorebi.iptv.IptvPlayback
+ import kr.dcmys.komorebi.platform.wideVideoArea
+ import kr.dcmys.komorebi.platform.windowMatchesAspect
  
- private const val TAG = "VideoPlayerScreen"
- private val PLAYER_CONTROLS_SUBTITLE_OFFSET = 96.dp
-@@ -102,6 +103,7 @@ private fun epgStationRecordedContainerMimeType(url: String): String? {
+@@ -104,6 +105,7 @@ private fun epgStationRecordedContainerMimeType(url: String): String? {
  private fun resolveMimeType(url: String): String? {
      return when {
          isEpgStationDirectVideoUrl(url) || isKonomiTvOriginalVideoUrl(url) -> MimeTypes.VIDEO_MP2T
@@ -855,7 +855,7 @@ index 955ab1f..008294f 100644
          else -> epgStationRecordedContainerMimeType(url) ?: run {
              if (url.contains("/api/streams/") || url.contains("/api/videos/") ||
                  url.contains("konomi.tv") || url.contains("m3u8")
-@@ -322,6 +324,10 @@ fun VideoPlayerScreen(
+@@ -324,6 +326,10 @@ fun VideoPlayerScreen(
      // ★ 追加: KonomiTVのoriginal画質(MPEG-2直接再生)も、EDCB直接再生と同じくExoPlayerの
      // SeekMapに頼らないバイト位置計算シーク方式で扱う必要がある
      val isKonomiOriginal = (backendType == "KONOMITV" && vs.currentQuality.value == "original")
@@ -866,7 +866,7 @@ index 955ab1f..008294f 100644
  
      // ★ 修正: 録画直接TS再生(isEdcbDirect)は、ExoPlayerのSeekMap機構(seekTo())に頼らず、
      // シーク要求のたびにアプリ側で目標バイト位置を計算してMediaItemを作り直す方式にした
-@@ -344,7 +350,7 @@ fun VideoPlayerScreen(
+@@ -346,7 +352,7 @@ fun VideoPlayerScreen(
          onStopOrDispose = { player ->
              if (smbItem == null) {
                  val posMs =
@@ -875,7 +875,7 @@ index 955ab1f..008294f 100644
                  videoPlayerViewModel.updateWatchHistory(program, posMs / 1000.0)
              }
          },
-@@ -361,7 +367,7 @@ fun VideoPlayerScreen(
+@@ -363,7 +369,7 @@ fun VideoPlayerScreen(
      // 実況コメントの追従位置がズレ続ける不具合があった。performSeek等と同様、毎回の
      // リコンポジションで最新の値を捕捉する普通のラムダにする(memo化するほど重い処理ではない)。
      val getCurrentPositionMs: () -> Long =
@@ -884,7 +884,7 @@ index 955ab1f..008294f 100644
      val subtitleCue = rememberNativeCaptionCue(
          events = subtitleEvents,
          enabled = vs.isSubtitleEnabled,
-@@ -422,7 +428,7 @@ fun VideoPlayerScreen(
+@@ -424,7 +430,7 @@ fun VideoPlayerScreen(
                      if (fetchedDetail != null) onShowToast("シーク先ストリームの取得に失敗しました")
                  }
              }
@@ -893,7 +893,7 @@ index 955ab1f..008294f 100644
              // ★ 追加: 録画直接TS再生のシークはExoPlayerネイティブのseekTo()に頼らず、
              // 目標バイト位置を計算してMediaItemを作り直す(VideoPlayerManager.kt参照)
              val byteOffset = computeSeekByteOffset(safeTarget)
-@@ -537,18 +543,20 @@ fun VideoPlayerScreen(
+@@ -539,18 +545,20 @@ fun VideoPlayerScreen(
          )
  
          if (url.isNotEmpty()) {

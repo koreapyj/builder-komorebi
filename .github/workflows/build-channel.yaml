@@ -162,6 +162,35 @@ jobs:
           done
           # a binary cannot live in a text patch
           cp "$GITHUB_WORKSPACE/fonts/WLCMARU2004ARIBU.TTF" app/src/main/assets/fonts/WLCMARU2004ARIBU.TTF
+          # the caption renderer is a submodule, out of reach of the patch series
+          bash "$GITHUB_WORKSPACE/third_party/scripts/patch-libaribcaption.sh" app
+
+      - name: Restore FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: third_party/prebuilt
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('third_party/**') }}
+
+      - name: Build FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        env:
+          FFMPEG_BUILD_DIR: ${{ runner.temp }}/ffmpeg-build
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends quilt pkg-config >/dev/null
+          bash third_party/scripts/build.sh
+
+      - name: Save FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: third_party/prebuilt
+          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
+
+      - name: Install FFmpeg
+        run: bash third_party/scripts/install-app.sh komorebi/app
 
       - name: Install Android SDK components
         run: |

@@ -24,16 +24,23 @@ ASSET_FONTS  := $(SRC)/app/src/main/assets/fonts
 NOTO_WEIGHTS := thin light regular medium semibold bold
 ARIB_FONT    := $(ASSET_FONTS)/WLCMARU2004ARIBU.TTF
 
+FFMPEG_SCRIPTS  := third_party/scripts
+FFMPEG_EXCLUDES := /app/src/main/cpp/third_party/ffmpeg/ \
+	$(foreach l,libavcodec libavfilter libavutil libswscale,/app/src/main/jniLibs/*/$(l).so)
+
 .DEFAULT_GOAL := help
-.PHONY: help prepare fonts build test update check clean
+.PHONY: help prepare fonts ffmpeg build test update check clean
 
 help:
 	@echo 'Local patch-authoring / test-build workflow (not used by CI).'
 	@echo
 	@echo 'Targets:'
 	@echo '  prepare   check out upstream $(KOMOREBI_REF) into $(SRC)/ (tag upstream-base, branch work),'
-	@echo '            git-am $(PATCHES)/*.patch on top, then run "fonts"'
+	@echo '            git-am $(PATCHES)/*.patch on top, then run "fonts" and "ffmpeg"'
 	@echo '  fonts     copy NotoSansJP into res/font and copy the ARIB font into assets (idempotent)'
+	@echo '  ffmpeg    cross-compile FFmpeg (arm64-v8a, armeabi-v7a) into third_party/prebuilt/ when'
+	@echo '            missing or stale, then install its .so files into app/src/main/jniLibs and its'
+	@echo '            headers into app/src/main/cpp/third_party/ffmpeg (idempotent)'
 	@echo '  build     ./gradlew :app:assemble$$(VARIANT) in $(SRC)/ and list the APKs'
 	@echo '  test      ./gradlew :app:testDebugUnitTest in $(SRC)/'
 	@echo '  update    regenerate $(PATCHES)/ from the commits on top of upstream-base in $(SRC)/'
@@ -42,7 +49,9 @@ help:
 	@echo
 	@echo 'Variables: KOMOREBI_REPO, KOMOREBI_REF (default $(KOMOREBI_REF)),'
 	@echo '           VARIANT (default $(VARIANT); Debug|Release),'
-	@echo '           ANDROID_HOME (default: environment, else .tmp/android-sdk if present)'
+	@echo '           ANDROID_HOME (default: environment, else .tmp/android-sdk if present),'
+	@echo '           FFMPEG_BUILD_DIR (default .tmp/ffmpeg-build),'
+	@echo '           FFMPEG_NDK (default: newest $$ANDROID_HOME/ndk/*, else a pinned r27c download)'
 	@echo
 	@echo 'Workflow: make prepare -> edit + git commit in $(SRC)/ -> make update -> make check'
 
@@ -72,6 +81,7 @@ prepare:
 			|| { echo "git am failed; resolve in $(SRC)/ or 'git -C $(SRC) am --abort'"; exit 1; }; \
 	fi
 	@$(MAKE) --no-print-directory fonts
+	@$(MAKE) --no-print-directory ffmpeg
 
 fonts:
 	@test -d $(SRC)/app || { echo "No $(SRC)/ -- run 'make prepare' first"; exit 1; }
@@ -86,6 +96,19 @@ fonts:
 		test -s $(FONT_DIR)/$$f || { echo "Copying $$f"; cp $(ASSET_FONTS)/$$f $(FONT_DIR)/$$f; }; \
 	done; \
 	cmp -s $(ARIB_FONT_SRC) $(ARIB_FONT) || { echo "Copying ARIB font"; cp $(ARIB_FONT_SRC) $(ARIB_FONT); }
+	@$(FFMPEG_SCRIPTS)/patch-libaribcaption.sh $(SRC)/app
+
+ffmpeg:
+	@test -d $(SRC)/app || { echo "No $(SRC)/ -- run 'make prepare' first"; exit 1; }
+	@set -ef; \
+	excl=$$(git -C $(SRC) rev-parse --git-path info/exclude); \
+	case "$$excl" in /*) ;; *) excl="$(SRC)/$$excl";; esac; \
+	mkdir -p "$$(dirname "$$excl")"; \
+	for p in $(FFMPEG_EXCLUDES); do \
+		grep -qxF "$$p" "$$excl" 2>/dev/null || echo "$$p" >> "$$excl"; \
+	done
+	@$(if $(ANDROID_HOME),ANDROID_HOME="$(ANDROID_HOME)" )$(FFMPEG_SCRIPTS)/build.sh
+	@$(FFMPEG_SCRIPTS)/install-app.sh $(SRC)/app
 
 build:
 	@test -x $(SRC)/gradlew || { echo "No $(SRC)/ -- run 'make prepare' first"; exit 1; }

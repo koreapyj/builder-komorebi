@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yoonji Park <koreapyj@dcmys.kr>
+Date: Fri, 27 Nov 2026 08:51:10 +0900
+Subject: [PATCH] ui: fix unreadable button labels and stretched video on
+ non-16:9 screens
+
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/components/InputDialog.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/components/InputDialog.kt
+index 89090c0..24f92a7 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/components/InputDialog.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/components/InputDialog.kt
+@@ -226,7 +226,8 @@ fun MonochromeButton(
+         Text(
+             text = text,
+             style = MaterialTheme.typography.labelLarge,
+-            fontWeight = FontWeight.Bold
++            fontWeight = FontWeight.Bold,
++            color = LocalContentColor.current
+         )
+     }
+ }
+\ No newline at end of file
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/live/LivePlayerScreen.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/live/LivePlayerScreen.kt
+index 6f23761..473dfc5 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/live/LivePlayerScreen.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/live/LivePlayerScreen.kt
+@@ -48,6 +48,7 @@ import com.beeregg2001.komorebi.data.model.StreamSource
+ import com.beeregg2001.komorebi.ui.subtitle.NativeCaptionOverlay
+ import com.beeregg2001.komorebi.ui.subtitle.rememberNativeCaptionCue
+ import com.beeregg2001.komorebi.ui.theme.KomorebiTheme
++import kr.dcmys.komorebi.platform.windowMatchesAspect
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
+ import org.json.JSONObject
+@@ -669,7 +670,7 @@ fun LivePlayerScreen(
+                         val isAnamorphic =
+                             (videoWidth == 1440 && videoHeight == 1080 && pixelWidthHeightRatio == 1.0f)
+                         val targetMode =
+-                            if (isAnamorphic || ratio >= 1.7f) AspectRatioFrameLayout.RESIZE_MODE_FILL else AspectRatioFrameLayout.RESIZE_MODE_FIT
++                            if (isAnamorphic || (ratio >= 1.7f && view.windowMatchesAspect(ratio))) AspectRatioFrameLayout.RESIZE_MODE_FILL else AspectRatioFrameLayout.RESIZE_MODE_FIT
+                         if (view.resizeMode != targetMode) view.resizeMode = targetMode
+                     }
+                 },
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/PlayerControls.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/PlayerControls.kt
+index 2bcdcea..a32b9a9 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/PlayerControls.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/PlayerControls.kt
+@@ -31,6 +31,7 @@ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.Path
+ import androidx.compose.ui.graphics.asImageBitmap
++import androidx.compose.ui.graphics.luminance
+ import androidx.compose.ui.graphics.drawscope.clipRect
+ import androidx.compose.ui.graphics.vector.ImageVector
+ import androidx.compose.ui.layout.ContentScale
+@@ -600,7 +601,7 @@ fun OsdIconButton(
+         colors = ClickableSurfaceDefaults.colors(
+             containerColor = if (isPrimary) colors.accent else Color.White.copy(alpha = 0.1f),
+             focusedContainerColor = Color.White,
+-            contentColor = Color.White,
++            contentColor = if (isPrimary && colors.accent.luminance() > 0.5f) Color.Black else Color.White,
+             focusedContentColor = Color.Black
+         ),
+         modifier = modifier
+diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerScreen.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerScreen.kt
+index 955ab1f..ed55317 100644
+--- a/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerScreen.kt
++++ b/app/src/main/java/com/beeregg2001/komorebi/ui/video/player/VideoPlayerScreen.kt
+@@ -53,6 +53,8 @@ import kotlinx.coroutines.flow.MutableSharedFlow
+ import kotlinx.coroutines.isActive
+ import kotlinx.coroutines.launch
+ import java.util.UUID
++import kr.dcmys.komorebi.platform.wideVideoArea
++import kr.dcmys.komorebi.platform.windowMatchesAspect
+ 
+ private const val TAG = "VideoPlayerScreen"
+ private val PLAYER_CONTROLS_SUBTITLE_OFFSET = 96.dp
+@@ -691,7 +693,7 @@ fun VideoPlayerScreen(
+                         (videoWidth.toFloat() * pixelWidthHeightRatio) / videoHeight.toFloat()
+                     view.setAspectRatio(ratio)
+                     val targetMode =
+-                        if (ratio >= 1.7f) AspectRatioFrameLayout.RESIZE_MODE_FILL else AspectRatioFrameLayout.RESIZE_MODE_FIT
++                        if (ratio >= 1.7f && view.windowMatchesAspect(ratio)) AspectRatioFrameLayout.RESIZE_MODE_FILL else AspectRatioFrameLayout.RESIZE_MODE_FIT
+                     if (view.resizeMode != targetMode) view.resizeMode = targetMode
+                 }
+             },
+@@ -734,6 +736,7 @@ fun VideoPlayerScreen(
+                         visible = vs.isSubtitleEnabled && !isSubtitleBlockingOverlayOpen,
+                         modifier = Modifier
+                             .fillMaxSize()
++                            .wideVideoArea(videoWidth, videoHeight, pixelWidthHeightRatio)
+                             .offset(y = -subtitleOffset)
+                     )
+                 }
+diff --git a/app/src/main/java/kr/dcmys/komorebi/platform/ScreenAspect.kt b/app/src/main/java/kr/dcmys/komorebi/platform/ScreenAspect.kt
+new file mode 100644
+index 0000000..42ea169
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/platform/ScreenAspect.kt
+@@ -0,0 +1,13 @@
++package kr.dcmys.komorebi.platform
++
++import android.view.View
++
++/** True when stretching a video of [videoAspect] over the whole window would distort it by under 3%. */
++fun View.windowMatchesAspect(videoAspect: Float): Boolean {
++    val root = rootView
++    val metrics = resources.displayMetrics
++    val width = if (root.width > 0) root.width else metrics.widthPixels
++    val height = if (root.height > 0) root.height else metrics.heightPixels
++    if (width <= 0 || height <= 0) return false
++    return aspectsMatch(width.toFloat() / height, videoAspect)
++}
+diff --git a/app/src/main/java/kr/dcmys/komorebi/platform/VideoArea.kt b/app/src/main/java/kr/dcmys/komorebi/platform/VideoArea.kt
+new file mode 100644
+index 0000000..4b23d98
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/platform/VideoArea.kt
+@@ -0,0 +1,35 @@
++package kr.dcmys.komorebi.platform
++
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.layout.layout
++import androidx.compose.ui.unit.Constraints
++import kotlin.math.abs
++import kotlin.math.roundToInt
++
++/** Upstream stretches video at least this wide over the whole screen; narrower video keeps its shape. */
++private const val WIDE_VIDEO_ASPECT = 1.7f
++
++fun aspectsMatch(a: Float, b: Float): Boolean = a > 0f && b > 0f && abs(a - b) / b < 0.03f
++
++/**
++ * Sizes an overlay to the area a wide video is drawn in: the whole parent when the parent has the
++ * video's shape (the video is stretched to fill it), the centred letterboxed rectangle otherwise.
++ */
++fun Modifier.wideVideoArea(videoAspect: Float): Modifier = layout { measurable, constraints ->
++    val width = constraints.maxWidth
++    val height = constraints.maxHeight
++    if (!constraints.hasBoundedWidth || !constraints.hasBoundedHeight || width <= 0 || height <= 0) {
++        val placeable = measurable.measure(constraints)
++        return@layout layout(placeable.width, placeable.height) { placeable.place(0, 0) }
++    }
++    val parentAspect = width.toFloat() / height
++    val fill = videoAspect < WIDE_VIDEO_ASPECT || aspectsMatch(parentAspect, videoAspect)
++    val areaWidth = if (fill || parentAspect < videoAspect) width else (height * videoAspect).roundToInt()
++    val areaHeight = if (fill || parentAspect >= videoAspect) height else (width / videoAspect).roundToInt()
++    val placeable = measurable.measure(Constraints.fixed(areaWidth, areaHeight))
++    layout(width, height) { placeable.place((width - areaWidth) / 2, (height - areaHeight) / 2) }
++}
++
++fun Modifier.wideVideoArea(videoWidth: Int, videoHeight: Int, pixelWidthHeightRatio: Float = 1f): Modifier =
++    if (videoWidth <= 0 || videoHeight <= 0) this
++    else wideVideoArea(videoWidth * pixelWidthHeightRatio / videoHeight)

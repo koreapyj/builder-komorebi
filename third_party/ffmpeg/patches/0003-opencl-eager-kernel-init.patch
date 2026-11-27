@@ -1,0 +1,55 @@
+yadif_opencl, bwdif_opencl, ivtc_opencl: build kernels at config time
+
+The program was compiled and the queue created on the first frame, so a
+broken OpenCL compiler only showed up mid-stream and the first frame stalled
+on the build. Do it in config_output so graph configuration fails instead.
+
+--- a/libavfilter/vf_bwdif_opencl.c
++++ b/libavfilter/vf_bwdif_opencl.c
+@@ -333,6 +333,12 @@ static int deint_opencl_config_output(AV
+     if (ret < 0)
+         return ret;
+ 
++    if (!ctx->initialised) {
++        ret = deint_opencl_kernel_init(avctx);
++        if (ret < 0)
++            return ret;
++    }
++
+     y->csp = in_desc;
+     y->filter = deint_opencl_filter;
+ 
+--- a/libavfilter/vf_yadif_opencl.c
++++ b/libavfilter/vf_yadif_opencl.c
+@@ -330,6 +330,12 @@ static int deint_opencl_config_output(AV
+     if (ret < 0)
+         return ret;
+ 
++    if (!ctx->initialised) {
++        ret = deint_opencl_kernel_init(avctx);
++        if (ret < 0)
++            return ret;
++    }
++
+     y->csp = in_desc;
+     y->filter = deint_opencl_filter;
+ 
+--- a/libavfilter/vf_ivtc_opencl.c
++++ b/libavfilter/vf_ivtc_opencl.c
+@@ -376,7 +376,15 @@ static int ivtc_config_output(AVFilterLi
+         }
+     }
+ 
+-    return ff_ivtc_config_output_common(outlink);
++    if ((ret = ff_ivtc_config_output_common(outlink)) < 0)
++        return ret;
++
++    if (!ctx->ivtc.initialised) {
++        if ((ret = ivtc_init_cl(avctx)) < 0)
++            return ret;
++        ctx->ivtc.initialised = 1;
++    }
++    return 0;
+ }
+ 
+ static int ivtc_init(AVFilterContext *avctx)

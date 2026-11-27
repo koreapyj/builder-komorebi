@@ -7,13 +7,29 @@ Subject: [PATCH] subtitles: render segmented ASS and honour the system caption
 Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
 
 diff --git a/app/src/main/cpp/native-lib.cpp b/app/src/main/cpp/native-lib.cpp
-index bfbb975..263c2a8 100644
+index bfbb975..4954d42 100644
 --- a/app/src/main/cpp/native-lib.cpp
 +++ b/app/src/main/cpp/native-lib.cpp
-@@ -578,6 +578,32 @@ Java_com_beeregg2001_komorebi_NativeLib_decodeCaption(JNIEnv *env, jobject thiz,
+@@ -578,6 +578,48 @@ Java_com_beeregg2001_komorebi_NativeLib_decodeCaption(JNIEnv *env, jobject thiz,
      return cue;
  }
  
++// The "file:" family needs the libaribcaption font-path patch; without it the lookup fails and
++// the renderer falls through to the system font.
++JNIEXPORT void JNICALL
++Java_com_beeregg2001_komorebi_NativeLib_setCaptionFont(JNIEnv *env, jobject thiz, jlong handle, jstring path) {
++    auto* ctx = reinterpret_cast<AribCaptionDecoderContext*>(handle);
++    if (!ctx || !ctx->renderer || !path) return;
++    const char* chars = env->GetStringUTFChars(path, nullptr);
++    if (!chars) return;
++    const std::string file = std::string("file:") + chars;
++    env->ReleaseStringUTFChars(path, chars);
++
++    const char* families[] = { file.c_str(), "sans-serif" };
++    std::lock_guard<std::mutex> lock(ctx->mutex);
++    aribcc_renderer_set_default_font_family(ctx->renderer, families, 2, true);
++}
++
 +// System caption style: draw no caption background (the forced stroke is kept), then
 +// re-render the caption current at ptsMs so it can replace the one already on screen.
 +JNIEXPORT jobject JNICALL
@@ -44,15 +60,17 @@ index bfbb975..263c2a8 100644
  Java_com_beeregg2001_komorebi_NativeLib_getCaptionLanguageCodes(JNIEnv *env, jobject thiz, jlong handle) {
      auto* ctx = reinterpret_cast<AribCaptionDecoderContext*>(handle);
 diff --git a/app/src/main/java/com/beeregg2001/komorebi/NativeLib.kt b/app/src/main/java/com/beeregg2001/komorebi/NativeLib.kt
-index 5781381..9d8e76a 100644
+index 5781381..0949b84 100644
 --- a/app/src/main/java/com/beeregg2001/komorebi/NativeLib.kt
 +++ b/app/src/main/java/com/beeregg2001/komorebi/NativeLib.kt
-@@ -37,5 +37,7 @@ class NativeLib {
+@@ -37,5 +37,9 @@ class NativeLib {
      external fun getCaptionLanguageCodes(handle: Long): IntArray
      external fun switchCaptionLanguage(handle: Long, languageId: Int)
      external fun flushCaptionDecoder(handle: Long)
 +    // System caption style: no background; returns the caption at ptsMs re-rendered (ptsMs < 0: none)
 +    external fun setCaptionNoBackground(handle: Long, noBackground: Boolean, ptsMs: Long): NativeCaptionCue?
++
++    external fun setCaptionFont(handle: Long, path: String)
      external fun closeCaptionDecoder(handle: Long)
  }
 diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/live/LiveDualPlayer.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/live/LiveDualPlayer.kt
@@ -94,19 +112,19 @@ index 2a3ce12..319e6cf 100644
                  androidx.compose.animation.AnimatedVisibility(
                      visible = showInfo,
 diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/live/LivePlayerScreen.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/live/LivePlayerScreen.kt
-index 6f23761..eadc4a3 100644
+index 473dfc5..d461814 100644
 --- a/app/src/main/java/com/beeregg2001/komorebi/ui/live/LivePlayerScreen.kt
 +++ b/app/src/main/java/com/beeregg2001/komorebi/ui/live/LivePlayerScreen.kt
-@@ -48,6 +48,8 @@ import com.beeregg2001.komorebi.data.model.StreamSource
- import com.beeregg2001.komorebi.ui.subtitle.NativeCaptionOverlay
+@@ -49,6 +49,8 @@ import com.beeregg2001.komorebi.ui.subtitle.NativeCaptionOverlay
  import com.beeregg2001.komorebi.ui.subtitle.rememberNativeCaptionCue
  import com.beeregg2001.komorebi.ui.theme.KomorebiTheme
+ import kr.dcmys.komorebi.platform.windowMatchesAspect
 +import kr.dcmys.komorebi.ass.IptvAssOverlay
 +import kr.dcmys.komorebi.ass.liveVideoRect
  import kotlinx.coroutines.delay
  import kotlinx.coroutines.launch
  import org.json.JSONObject
-@@ -711,6 +713,12 @@ fun LivePlayerScreen(
+@@ -712,6 +714,12 @@ fun LivePlayerScreen(
                          visible = isSubtitleEnabled && !isUiVisible,
                          modifier = Modifier.fillMaxSize()
                      )
@@ -120,30 +138,37 @@ index 6f23761..eadc4a3 100644
  
                  if (isHeavyUiReady && isCommentEnabled) {
 diff --git a/app/src/main/java/com/beeregg2001/komorebi/ui/subtitle/NativeCaptionDecoder.kt b/app/src/main/java/com/beeregg2001/komorebi/ui/subtitle/NativeCaptionDecoder.kt
-index f2eff8e..d6c9718 100644
+index f2eff8e..50ab5c6 100644
 --- a/app/src/main/java/com/beeregg2001/komorebi/ui/subtitle/NativeCaptionDecoder.kt
 +++ b/app/src/main/java/com/beeregg2001/komorebi/ui/subtitle/NativeCaptionDecoder.kt
-@@ -2,6 +2,7 @@ package com.beeregg2001.komorebi.ui.subtitle
+@@ -2,6 +2,8 @@ package com.beeregg2001.komorebi.ui.subtitle
  
  import android.util.Log
  import com.beeregg2001.komorebi.NativeLib
++import kr.dcmys.komorebi.platform.AribCaptionFont
 +import kr.dcmys.komorebi.platform.AribCaptionSystemStyle
  
  class NativeCaptionDecoder(
      private val nativeLib: NativeLib = NativeLib()
-@@ -10,6 +11,7 @@ class NativeCaptionDecoder(
+@@ -10,6 +12,8 @@ class NativeCaptionDecoder(
      private var languages: List<NativeCaptionLanguage> = emptyList()
      private var lastPtsMs: Long? = null
      private var lastManagementData: ByteArray? = null
 +    private var appliedNoBackground = false
++    private var appliedFontPath: String? = null
  
      @Synchronized
      fun decode(
-@@ -24,7 +26,12 @@ class NativeCaptionDecoder(
+@@ -24,7 +28,17 @@ class NativeCaptionDecoder(
                  nativeLib.flushCaptionDecoder(activeHandle)
              }
              lastPtsMs = ptsMs
 -            val cue = nativeLib.decodeCaption(activeHandle, data, ptsMs)
++            val fontPath = AribCaptionFont.path
++            if (fontPath != null && fontPath != appliedFontPath) {
++                appliedFontPath = fontPath
++                nativeLib.setCaptionFont(activeHandle, fontPath)
++            }
 +            var cue = nativeLib.decodeCaption(activeHandle, data, ptsMs)
 +            val noBackground = AribCaptionSystemStyle.noBackground
 +            if (noBackground != appliedNoBackground) {
@@ -153,11 +178,12 @@ index f2eff8e..d6c9718 100644
              // 管理データが言語表を更新したときだけ JNI 問い合わせを行う。
              val managementChanged = AribCaptionData.isManagementPacket(data) &&
                  lastManagementData?.contentEquals(data) != true
-@@ -70,6 +77,7 @@ class NativeCaptionDecoder(
+@@ -70,6 +84,8 @@ class NativeCaptionDecoder(
          val activeHandle = handle
          if (activeHandle != 0L) nativeLib.closeCaptionDecoder(activeHandle)
          handle = nativeLib.openCaptionDecoder()
 +        appliedNoBackground = false
++        appliedFontPath = null
          languages = emptyList()
          lastPtsMs = null
          lastManagementData = null
@@ -1797,10 +1823,10 @@ index 0000000..d9d9c79
 +}
 diff --git a/app/src/main/java/kr/dcmys/komorebi/ass/IptvAssOverlay.kt b/app/src/main/java/kr/dcmys/komorebi/ass/IptvAssOverlay.kt
 new file mode 100644
-index 0000000..fdc0223
+index 0000000..68c649e
 --- /dev/null
 +++ b/app/src/main/java/kr/dcmys/komorebi/ass/IptvAssOverlay.kt
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,175 @@
 +@file:OptIn(UnstableApi::class)
 +
 +package kr.dcmys.komorebi.ass
@@ -1832,6 +1858,7 @@ index 0000000..fdc0223
 +import dagger.hilt.android.EntryPointAccessors
 +import dagger.hilt.components.SingletonComponent
 +import kr.dcmys.komorebi.iptv.IptvHttp
++import kr.dcmys.komorebi.platform.aspectsMatch
 +import kr.dcmys.komorebi.platform.rememberSystemCaptionStyle
 +import okhttp3.OkHttpClient
 +import kotlin.math.abs
@@ -1902,8 +1929,8 @@ index 0000000..fdc0223
 +}
 +
 +/**
-+ * Mirrors LivePlayerScreen's resize-mode choice (FILL for 1440x1080 with square pixels or any
-+ * ratio >= 1.7, else FIT) and AspectRatioFrameLayout's FIT measurement (display aspect
++ * Mirrors LivePlayerScreen's resize-mode choice (FILL for 1440x1080 with square pixels or a
++ * ratio >= 1.7 that matches the view, else FIT) and AspectRatioFrameLayout's FIT measurement (display aspect
 + * `width * pixelWidthHeightRatio / height`, 1% tolerance, centred).
 + */
 +fun Modifier.liveVideoRect(
@@ -1955,7 +1982,10 @@ index 0000000..fdc0223
 +    if (viewWidth <= 0 || viewHeight <= 0 || videoWidth <= 0 || videoHeight <= 0) return viewWidth to viewHeight
 +    val isAnamorphic = videoWidth == 1440 && videoHeight == 1080 && pixelWidthHeightRatio == 1.0f
 +    val storageRatio = videoWidth.toFloat() / videoHeight.toFloat()
-+    if (isAnamorphic || storageRatio >= FILL_MIN_RATIO) return viewWidth to viewHeight
++    val viewAspect = viewWidth.toFloat() / viewHeight
++    if (isAnamorphic || (storageRatio >= FILL_MIN_RATIO && aspectsMatch(viewAspect, storageRatio))) {
++        return viewWidth to viewHeight
++    }
 +    val videoAspect = videoWidth * pixelWidthHeightRatio / videoHeight
 +    if (!(videoAspect > 0f) || !videoAspect.isFinite()) return viewWidth to viewHeight
 +    val deformation = videoAspect / (viewWidth.toFloat() / viewHeight) - 1
@@ -1972,6 +2002,38 @@ index 0000000..fdc0223
 +
 +/** AspectRatioFrameLayout.MAX_ASPECT_RATIO_DEFORMATION_FRACTION. */
 +private const val MAX_ASPECT_DEFORMATION = 0.01f
+diff --git a/app/src/main/java/kr/dcmys/komorebi/platform/AribCaptionFont.kt b/app/src/main/java/kr/dcmys/komorebi/platform/AribCaptionFont.kt
+new file mode 100644
+index 0000000..3419cd5
+--- /dev/null
++++ b/app/src/main/java/kr/dcmys/komorebi/platform/AribCaptionFont.kt
+@@ -0,0 +1,26 @@
++package kr.dcmys.komorebi.platform
++
++import android.content.Context
++import java.io.File
++
++/** The native caption renderer opens fonts by file path, so the bundled asset is copied out once. */
++object AribCaptionFont {
++    private const val ASSET = "fonts/WLCMARU2004ARIBU.TTF"
++
++    @Volatile
++    var path: String? = null
++        private set
++
++    fun prepare(context: Context) {
++        if (path != null) return
++        path = runCatching {
++            val bytes = context.assets.open(ASSET).use { it.readBytes() }
++            val file = File(context.filesDir, ASSET)
++            if (file.length() != bytes.size.toLong()) {
++                file.parentFile?.mkdirs()
++                file.writeBytes(bytes)
++            }
++            file.absolutePath
++        }.getOrNull()
++    }
++}
 diff --git a/app/src/main/java/kr/dcmys/komorebi/platform/AribCaptionSystemStyle.kt b/app/src/main/java/kr/dcmys/komorebi/platform/AribCaptionSystemStyle.kt
 new file mode 100644
 index 0000000..86874d9
@@ -1994,10 +2056,10 @@ index 0000000..86874d9
 +}
 diff --git a/app/src/main/java/kr/dcmys/komorebi/platform/SystemCaptionStyle.kt b/app/src/main/java/kr/dcmys/komorebi/platform/SystemCaptionStyle.kt
 new file mode 100644
-index 0000000..cf0e600
+index 0000000..5773945
 --- /dev/null
 +++ b/app/src/main/java/kr/dcmys/komorebi/platform/SystemCaptionStyle.kt
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,70 @@
 +package kr.dcmys.komorebi.platform
 +
 +import android.content.Context
@@ -2005,11 +2067,14 @@ index 0000000..cf0e600
 +import android.view.accessibility.CaptioningManager
 +import androidx.compose.runtime.Composable
 +import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
 +import androidx.compose.runtime.getValue
 +import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.remember
 +import androidx.compose.runtime.setValue
 +import androidx.compose.ui.platform.LocalContext
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
 +
 +/**
 + * Text colour, typeface and font scale are deliberately excluded: ARIB text colour carries meaning
@@ -2051,6 +2116,7 @@ index 0000000..cf0e600
 +fun rememberSystemCaptionStyle(): SystemCaptionStyle {
 +    val context = LocalContext.current.applicationContext
 +    var style by remember { mutableStateOf(SystemCaptionStyle.current(context)) }
++    LaunchedEffect(context) { withContext(Dispatchers.IO) { AribCaptionFont.prepare(context) } }
 +    DisposableEffect(context) {
 +        val manager = context.getSystemService(Context.CAPTIONING_SERVICE) as? CaptioningManager
 +        val listener = object : CaptioningManager.CaptioningChangeListener() {
@@ -2766,10 +2832,10 @@ index 0000000..fc584d3
 +}
 diff --git a/app/src/test/java/kr/dcmys/komorebi/ass/VideoRectTest.kt b/app/src/test/java/kr/dcmys/komorebi/ass/VideoRectTest.kt
 new file mode 100644
-index 0000000..30c8b09
+index 0000000..dd88b15
 --- /dev/null
 +++ b/app/src/test/java/kr/dcmys/komorebi/ass/VideoRectTest.kt
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,40 @@
 +package kr.dcmys.komorebi.ass
 +
 +import org.junit.Assert.assertEquals
@@ -2787,8 +2853,12 @@ index 0000000..30c8b09
 +        assertEquals(1920 to 1080, fitVideoRect(1920, 1080, 1920, 1080, 1f))
 +        // 1440x1080 with square pixels is treated as anamorphic 16:9 and stretched.
 +        assertEquals(1920 to 1080, fitVideoRect(1920, 1080, 1440, 1080, 1f))
-+        // A 2.35:1 picture is stretched too (FILL from 1.7 up).
-+        assertEquals(1280 to 1080, fitVideoRect(1280, 1080, 2350, 1000, 1f))
++    }
++
++    @Test
++    fun wideVideoKeepsItsShapeInAViewOfAnotherShape() {
++        assertEquals(1280 to 544, fitVideoRect(1280, 1080, 2350, 1000, 1f))
++        assertEquals(1920 to 1080, fitVideoRect(1920, 1200, 1920, 1080, 1f))
 +    }
 +
 +    @Test

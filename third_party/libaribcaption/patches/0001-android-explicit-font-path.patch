@@ -1,0 +1,29 @@
+font_provider_android: load a font from an explicit path
+
+A font family name of the form "file:<path>" selects that font file
+directly, so an app can render captions with a font it bundles.
+
+diff --git a/src/renderer/font_provider_android.cpp b/src/renderer/font_provider_android.cpp
+index f27c347..72a4418 100644
+--- a/src/renderer/font_provider_android.cpp
++++ b/src/renderer/font_provider_android.cpp
+@@ -54,6 +54,19 @@ void FontProviderAndroid::SetLanguage(uint32_t iso6392_language_code) {
+ 
+ auto FontProviderAndroid::GetFontFace(const std::string &font_name,
+                                       std::optional<uint32_t> ucs4) -> Result<FontfaceInfo, FontProviderError> {
++    if (font_name.rfind("file:", 0) == 0) {
++        const std::string path = font_name.substr(5);
++        if (access(path.c_str(), R_OK) != 0) {
++            return Err(FontProviderError::kFontNotFound);
++        }
++        FontfaceInfo info;
++        info.family_name = font_name;
++        info.filename = path;
++        info.face_index = 0;
++        info.provider_type = FontProviderType::kAndroid;
++        return Ok(std::move(info));
++    }
++
+     FontFile* font_file = nullptr;
+ 
+     if (iso6392_language_code_ == ThreeCC("jpn") || iso6392_language_code_ == 0) {
